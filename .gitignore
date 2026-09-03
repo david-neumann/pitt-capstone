@@ -4,3 +4,17 @@
 .httr-oauth
 .DS_Store
 .quarto
+renv/library/
+Thumbs.db
+
+# Data
+data/raw/*
+!data/raw/.gitkeep
+data/interim/*
+data/processed/*
+!data/processed/.gitkeep
+
+# Rendered output
+*_files/
+*_cache/
+/.quarto/
