@@ -18,3 +18,5 @@ data/processed/*
 *_files/
 *_cache/
 /.quarto/
+outputs/figures/*.mp4
+*.gif
