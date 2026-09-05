@@ -1,6 +1,4 @@
-# Field constants, in yards. Length includes both end zones.
-FIELD_LENGTH <- 120
-FIELD_WIDTH <- 160 / 3
+source(here::here("R", "constants.R"))
 
 # camelCase -> snake_case
 to_snake <- function(x) {
@@ -17,7 +15,7 @@ to_snake <- function(x) {
 standardize_direction <- function(df) {
   flip <- df$play_direction == "left"
   df |>
-    mutate(
+    dplyr::mutate(
       x = if_else(flip, FIELD_LENGTH - x, x),
       y = if_else(flip, FIELD_WIDTH - y, y),
       dir = if_else(flip, (dir + 180) %% 360, dir),
@@ -27,5 +25,5 @@ standardize_direction <- function(df) {
 
 #' Flip a line-of-scrimmage value into standardized coordinates
 standardize_los <- function(los, play_direction) {
-  if_else(play_direction == "left", FIELD_LENGTH - los, los)
+  dplyr::if_else(play_direction == "left", FIELD_LENGTH - los, los)
 }

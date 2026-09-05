@@ -3,7 +3,9 @@ library(dplyr)
 library(fs)
 library(here)
 
+source(here("R", "constants.R"))
 source(here("R", "standardize.R"))
+source(here("R", "viz.R"))
 
 interim <- here("data", "interim")
 processed <- here("data", "processed")
@@ -92,9 +94,28 @@ for (w in 1:17) {
     ) |>
     standardize_direction() |>
     select(
-      game_id, play_id, week, frame_id, nfl_id, display_name, position,
-      jersey_number, team_abbr, side, is_ball,
-      x, y, s, a, dis, o, dir, event, route, time, play_direction
+      game_id,
+      play_id,
+      week,
+      frame_id,
+      nfl_id,
+      display_name,
+      position,
+      jersey_number,
+      team_abbr,
+      side,
+      is_ball,
+      x,
+      y,
+      s,
+      a,
+      dis,
+      o,
+      dir,
+      event,
+      route,
+      time,
+      play_direction
     ) |>
     write_parquet(path(processed, "tracking", sprintf("week_%02d.parquet", w)))
 
@@ -102,4 +123,3 @@ for (w in 1:17) {
 }
 
 message("Done.")
-
