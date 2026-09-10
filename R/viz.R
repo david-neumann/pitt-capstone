@@ -16,7 +16,7 @@ library(gganimate)
 
 source(here::here("R", "constants.R"))
 
-# ---- team colours -----------------------------------------------------
+# ---- team colors -----------------------------------------------------
 
 .viz_cache <- new.env(parent = emptyenv())
 

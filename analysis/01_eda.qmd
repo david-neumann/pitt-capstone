@@ -1,0 +1,48 @@
+---
+title: "NFL BDB 2021 — Exploratory Data Analysis"
+subtitle: "STAT 1961 Capstone"
+author: "David Neumann"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show code"
+    fig-width: 8
+    fig-height: 5
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+  cache: true
+---
+
+```{r}
+#| label: setup
+if (Sys.getenv("RENV_PROJECT") == "") {
+  root <- normalizePath("..", mustWork = TRUE)
+  Sys.setenv(RENV_PROJECT = root)
+  setwd(root)
+  source("renv/activate.R")
+}
+
+library(tidyverse)
+library(arrow)
+library(here)
+library(nflverse)
+library(gt)
+library(patchwork)
+library(scales)
+
+source(here("R", "viz.R"))
+```
+
+```{r}
+#| label: load_data
+trk <- open_dataset(here("data", "processed", "tracking"))
+plays <- read_parquet(here("data", "processed", "plays.parquet"))
+players <- read_parquet(here("data", "processed", "players.parquet"))
+games <- read_parquet(here("data", "processed", "games.parquet"))
+```
+
