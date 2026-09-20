@@ -21,5 +21,6 @@ data/processed/*
 outputs/figures/*.mp4
 *.gif
 *.html
+_freeze/
 
 **/*.quarto_ipynb

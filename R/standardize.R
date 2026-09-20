@@ -1,9 +1,7 @@
-source(here::here("R", "constants.R"))
+# R/standardize.R ------------------------------------------------------
+# Coordinate-frame normalization. Defines functions only.
 
-# camelCase -> snake_case
-to_snake <- function(x) {
-  tolower(gsub("([a-z0-9])([A-Z])", "\\1_\\2", x))
-}
+source(here::here("R", "constants.R"))
 
 #' Rotate left-moving plays 180 degrees so every offense advances in +x
 #'
@@ -12,14 +10,27 @@ to_snake <- function(x) {
 #' which is a bug that produces entirely plausible-looking output.
 #' Angles shift by 180 degrees under the same rotation, which holds
 #' regardless of where the angle convention places zero.
+#'
+#' The play_direction guard matters because if_else() propagates an NA
+#' condition into an NA result: a single unresolved play_direction would
+#' blank x, y, dir, and o for every row of that play rather than erroring.
 standardize_direction <- function(df) {
+  if (anyNA(df$play_direction)) {
+    stop(
+      "play_direction has ",
+      sum(is.na(df$play_direction)),
+      " missing values; rotation would silently NA out those coordinates.",
+      call. = FALSE
+    )
+  }
+
   flip <- df$play_direction == "left"
   df |>
     dplyr::mutate(
-      x = if_else(flip, FIELD_LENGTH - x, x),
-      y = if_else(flip, FIELD_WIDTH - y, y),
-      dir = if_else(flip, (dir + 180) %% 360, dir),
-      o = if_else(flip, (o + 180) %% 360, o)
+      x = dplyr::if_else(flip, FIELD_LENGTH - x, x),
+      y = dplyr::if_else(flip, FIELD_WIDTH - y, y),
+      dir = dplyr::if_else(flip, (dir + 180) %% 360, dir),
+      o = dplyr::if_else(flip, (o + 180) %% 360, o)
     )
 }
 

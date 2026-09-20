@@ -7,7 +7,7 @@ format:
   html:
     toc: true
     toc-depth: 3
-    code-fold: true
+    theme: [brite, ../theme/capstone.scss]
     code-summary: "Show code"
     fig-width: 8
     fig-height: 5
@@ -15,34 +15,1911 @@ format:
 execute:
   warning: false
   message: false
-  cache: true
 ---
+
+# 0. Setup
 
 ```{r}
 #| label: setup
-if (Sys.getenv("RENV_PROJECT") == "") {
-  root <- normalizePath("..", mustWork = TRUE)
-  Sys.setenv(RENV_PROJECT = root)
-  setwd(root)
-  source("renv/activate.R")
-}
+#| include: false
 
 library(tidyverse)
 library(arrow)
 library(here)
 library(nflverse)
 library(gt)
+library(gtExtras)
 library(patchwork)
 library(scales)
 
+source(here("R", "constants.R"))
+source(here("R", "utils.R"))
+source(here("R", "standardize.R"))
+source(here("R", "coverage.R"))
+source(here("R", "sample_rules.R"))
 source(here("R", "viz.R"))
 ```
 
+## 0.1 What this notebook is, and is not
+
+This notebook reports. It does not build. Every table below reads a
+persisted artifact; nothing here defines the sample, and nothing here writes
+to `data/`.
+
+| Layer | Owns | Files |
+|---|---|---|
+| Mirror | Faithful copy of the Kaggle download | `scripts/01_raw_to_parquet.R` |
+| Canonical | Naming, deduplication, `side` derivation, coordinate standardization, key types | `scripts/02_build_canonical.R` |
+| Index | Measured facts about every play and player-play | `scripts/03_build_play_index.R` |
+| Sample | Exclusion decisions | `scripts/04_build_sample.R`, `R/sample_rules.R` |
+| Report | Diagnostics and prose | this file |
+
+The test separating the index layer from the sample layer: a column that
+answers *"what is true of this play"* belongs in `play_index`; a column that
+answers *"should this play be kept"* is a decision and belongs in
+`sample_flags`. `has_kinematic_defect` is the first kind. `keep_clean_window`
+is the second.
+
+Six chunks below still query the tracking dataset directly, because they need
+row-level distributions rather than play-level summaries: coordinate bounds,
+kinematic histograms, column missingness, the zero-offense geometry test, the
+direction-convention test, and the standardization check. Everything else
+reads the index.
+
 ```{r}
 #| label: load_data
+
 trk <- open_dataset(here("data", "processed", "tracking"))
+
 plays <- read_parquet(here("data", "processed", "plays.parquet"))
 players <- read_parquet(here("data", "processed", "players.parquet"))
 games <- read_parquet(here("data", "processed", "games.parquet"))
+targets <- read_parquet(here("data", "processed", "targeted_receiver.parquet"))
+coverages <- read_parquet(here("data", "processed", "coverages_week1.parquet"))
+
+play_index <- read_parquet(here("data", "processed", "play_index.parquet"))
+player_play <- read_parquet(here(
+  "data",
+  "processed",
+  "player_play_index.parquet"
+))
+play_events <- read_parquet(here("data", "processed", "play_events.parquet"))
+defects <- read_parquet(here("data", "processed", "kinematic_defects.parquet"))
+
+sample_flags <- read_parquet(here("data", "processed", "sample_flags.parquet"))
+sample_funnel <- read_parquet(here(
+  "data",
+  "processed",
+  "sample_funnel.parquet"
+))
+analytic_sample <- read_parquet(here(
+  "data",
+  "processed",
+  "analytic_sample.parquet"
+))
 ```
 
+A convenience table used repeatedly below: play-level context joined onto the
+index. Small enough to build once in memory.
+
+```{r}
+#| label: play_context
+
+play_context <- play_index |>
+  left_join(
+    plays |>
+      select(
+        game_id,
+        play_id,
+        week,
+        pass_result,
+        offense_formation,
+        type_dropback,
+        personnel_d,
+        down,
+        quarter,
+        yards_to_go,
+        los_x,
+        play_direction
+      ),
+    by = c("game_id", "play_id")
+  )
+```
+
+# 1. Dataset Inventory
+
+## 1.1 Basic Counts
+
+Row counts come off the index rather than an aggregate over 18.3M rows. The
+identity $n_{\text{rows}} = n_{\text{player rows}} + n_{\text{ball rows}}$
+holds because ball rows are one per frame after deduplication, which 2.3
+verifies.
+
+```{r}
+#| label: counts
+
+tibble(
+  quantity = c(
+    "games",
+    "plays (plays.parquet)",
+    "plays (tracking)",
+    "distinct tracked players",
+    "player-plays",
+    "player rows",
+    "ball rows",
+    "tracking rows"
+  ),
+  n = c(
+    nrow(games),
+    nrow(plays),
+    nrow(play_index),
+    n_distinct(player_play$nfl_id),
+    nrow(player_play),
+    sum(play_index$n_rows),
+    sum(play_index$n_ball_frames),
+    sum(play_index$n_rows) + sum(play_index$n_ball_frames)
+  )
+) |>
+  mutate(n = comma(n)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Distinct tracked players equals `nrow(players)`, so `players.parquet` contains
+exactly the players who appear in tracking rather than the full league. This is
+asserted in `03_build_play_index.R`; 2.7 displays the check.
+
+```{r}
+#| label: dedup-log
+
+# 02_build_canonical.R deduplicates the raw week files and logs what it
+# removed. Surfaced here so the cleaning step appears in the record.
+read_parquet(here("data", "processed", "dedup_log.parquet")) |>
+  mutate(rows_removed = rows_in - rows_out) |>
+  filter(rows_removed > 0) |>
+  gt() |>
+  fmt_number(columns = -week, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+## 1.2 Players tracked per play
+
+Linemen are excluded from tracking on all but a handful of plays — see 2.5 for
+the exceptions — but there may be varying numbers of non-linemen on the field
+depending on personnel packages.
+
+```{r}
+#| label: players-per-play
+
+play_index |>
+  count(n_players, sort = TRUE) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.01)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: extreme-player-counts
+
+extreme_plays <- play_context |>
+  filter(n_players <= 11 | n_players >= 18) |>
+  select(
+    game_id,
+    play_id,
+    n_players,
+    n_offense,
+    n_defense,
+    offense_formation,
+    pass_result
+  )
+
+extreme_plays |>
+  count(n_players, has_formation = !is.na(offense_formation), sort = TRUE) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-note appearance="simple"}
+
+These plays fall into three buckets:
+
+1. **Special teams fakes or aborted plays.** No `offense_formation`. Removed by
+   `keep_live_play` in 4.2.
+2. **Goal line plays.** High numbers of linemen. Retained; a goal-line
+   exclusion is a question-level decision, not a data-quality one.
+3. **Defensive packages with few linemen.** Standard situations, retained.
+
+The filter is tied to the named defect (`offense_formation` missing) rather
+than to `n_players`, which would select on defensive scheme rather than on
+data quality.
+
+:::
+
+## 1.3 Players tracked per play, by offense and defense
+
+Offense should be consistent, with 6 on most plays and 5 on some (6OL
+packages). Defense is more varied.
+
+```{r}
+#| label: players-per-side
+
+play_index |>
+  count(n_offense, n_defense, sort = TRUE) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.01)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+## 1.4 Play frames
+
+```{r}
+#| label: frames-per-play
+
+ggplot(play_index, aes(x = n_frames)) +
+  geom_histogram(binwidth = 5, fill = "lightsteelblue3", color = "black") +
+  labs(
+    title = "Frames per play",
+    subtitle = "10 Hz, so 50 frames = 5 seconds",
+    x = "frames",
+    y = "plays"
+  ) +
+  theme_minimal()
+```
+
+`gapless` in the player-level index compares a player's row count against their
+frame span, so it fails for a duplicated row as readily as for a missing one.
+On the pre-deduplication build every non-gapless player-play turned out to be
+duplication rather than a gap; 2.3 documents that. A non-gapless row here now
+means a genuine mid-play dropout.
+
+```{r}
+#| label: cadence
+
+player_play |>
+  count(gapless, starts_at_one) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.01)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+## 1.5 Reconciling raggedness
+
+The row-count identity
+$n_{\text{rows}} = n_{\text{players}} \times n_{\text{frames}}$ can fail two
+ways, and the per-player gap check only sees one of them: it looks *within* a
+player and never checks agreement *across* players in the same play. A player
+who drops out at frame 40 while everyone else runs to frame 60 is gapless,
+starts at frame one, and still breaks the identity.
+
+`ragged_cause` is computed in `03_build_play_index.R` from `n_gapped` and
+`n_distinct_last`.
+
+```{r}
+#| label: raggedness-causes
+
+play_index |>
+  count(ragged_cause, sort = TRUE) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.01)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Uneven endpoints should be the only mechanism on a deduplicated build. An
+`unexplained` count above zero means the identity is failing for a reason
+neither diagnostic covers; `internal gaps` above zero means either a genuine
+mid-play dropout or that duplication has been reintroduced upstream, which 2.3
+distinguishes.
+
+```{r}
+#| label: raggedness-severity
+
+# min matters as much as max: a negative frames_lost means surplus rows, which
+# is duplication rather than attrition. Reporting only the median, p90, and
+# max hid exactly that on the pre-deduplication build.
+play_index |>
+  filter(ragged) |>
+  summarize(
+    plays = n(),
+    min_frames_lost = min(frames_lost),
+    median_frames_lost = median(frames_lost),
+    p90_frames_lost = quantile(frames_lost, 0.9),
+    max_frames_lost = max(frames_lost)
+  ) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+# 2. Dataset Integrity
+
+## 2.1 Coordinate bounds
+
+A football field is $120 \times 53.3$ yards including end zones. Values slightly
+outside these are expected as players run out of bounds, but large differences
+would indicate corruption.
+
+```{r}
+#| label: coord-bounds
+
+trk |>
+  summarize(
+    across(
+      c(x, y),
+      list(min = min, max = max, mean = mean),
+      .names = "{.col}_{.fn}"
+    )
+  ) |>
+  collect() |>
+  gt() |>
+  fmt_number(decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: coord-oob
+
+trk |>
+  summarize(
+    beyond_x = sum(x < -10 | x > 130, na.rm = TRUE),
+    beyond_y = sum(y < -10 | y > (190 / 3), na.rm = TRUE)
+  ) |>
+  collect() |>
+  pivot_longer(everything(), names_to = "check", values_to = "rows") |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+## 2.2 Kinematics plausibility
+
+Speed `s` is yd/s. Elite human top speed is about $10.5$ yd/s, so anything
+above $13$ is not a football player. Per-frame displacement `dis` is bounded by
+the same speed over a $0.1$ s frame, i.e. $1.3$ yd. `dir` and `o` should lie in
+$[0, 360)$.
+
+`MAX_SPEED`, `MAX_DIS`, and `MAX_ACCEL` now live in `R/constants.R` rather than
+being defined inline here, because `03_build_play_index.R` flags defective rows
+with them and a threshold that differed between the script and the notebook
+would make the two disagree about which plays are clean.
+
+```{r}
+#| label: kinematics-thresholds-shown
+
+tibble(
+  threshold = c("MAX_SPEED (yd/s)", "MAX_DIS (yd/frame)", "MAX_ACCEL (yd/s^2)"),
+  value = c(MAX_SPEED, MAX_DIS, MAX_ACCEL)
+) |>
+  gt() |>
+  fmt_number(columns = value, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: kinematics-bins
+
+bin_w <- c(s = 0.1, a = 0.1, dis = 0.01, dir = 2, o = 2)
+
+kin_hist <- imap(bin_w, \(w, col) {
+  trk |>
+    filter(!is_ball) |>
+    mutate(bin = floor(!!sym(col) / w) * w) |>
+    count(bin) |>
+    collect() |>
+    mutate(name = col, width = w)
+}) |>
+  list_rbind() |>
+  mutate(name = factor(name, levels = names(bin_w)))
+
+kin_na <- kin_hist |>
+  filter(is.na(bin)) |>
+  select(name, n_missing = n)
+
+kin_hist <- filter(kin_hist, !is.na(bin))
+```
+
+```{r}
+#| label: kinematics-missing
+
+kin_na |> gt() |> gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: kinematics-dist
+
+ggplot(kin_hist, aes(x = bin, y = n, width = width)) +
+  geom_col(fill = "lightsteelblue3") +
+  facet_wrap(~name, scales = "free") +
+  scale_y_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  labs(title = "Kinematic column distributions", x = NULL, y = NULL) +
+  theme_minimal()
+```
+
+The tail quantiles come from the same bin counts, exact to the bin width.
+Arrow's `quantile()` is a t-digest approximation, which is the wrong tool when
+the target is a handful of rows in the extreme tail. Exact extrema are a
+separate scalar aggregate, cheap because nothing is materialized.
+
+```{r}
+#| label: kinematics-tails
+
+kin_quantiles <- kin_hist |>
+  filter(name %in% c("s", "a", "dis")) |>
+  arrange(name, bin) |>
+  group_by(name) |>
+  summarize(
+    p50 = bin[which.max(cumsum(n) / sum(n) >= 0.50)],
+    p99 = bin[which.max(cumsum(n) / sum(n) >= 0.99)],
+    .groups = "drop"
+  )
+
+kin_extrema <- trk |>
+  filter(!is_ball) |>
+  summarize(
+    across(c(s, a, dis), list(min = min, max = max), .names = "{.col}_{.fn}")
+  ) |>
+  collect() |>
+  pivot_longer(
+    everything(),
+    names_to = c("name", ".value"),
+    names_pattern = "(.*)_(min|max)$"
+  )
+
+kin_quantiles |>
+  left_join(kin_extrema, by = "name") |>
+  relocate(min, .after = name) |>
+  gt() |>
+  fmt_number(columns = -name, decimals = 4) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+### Implausible rows
+
+`kinematic_defects.parquet` is one row per defective tracking row, with the
+violated bound (`which`) and the row's position relative to the measurement
+window (`position_in_play`) already attached by
+`03_build_play_index.R`.
+
+```{r}
+#| label: kinematics-defects
+
+tibble(
+  quantity = c(
+    "defective rows",
+    "plays affected",
+    "players affected",
+    "games affected"
+  ),
+  n = c(
+    nrow(defects),
+    n_distinct(defects$game_id, defects$play_id),
+    n_distinct(defects$nfl_id),
+    n_distinct(defects$game_id)
+  )
+) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: kinematics-defects-detail
+
+defects |>
+  count(which, week) |>
+  pivot_wider(names_from = which, values_from = n, values_fill = 0) |>
+  arrange(week) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: defects-by-week
+
+# Speed violations concentrate in a small number of weeks. That clustering is a
+# collection artifact rather than noise.
+defects |>
+  group_by(week) |>
+  summarize(
+    rows = n(),
+    plays = n_distinct(game_id, play_id),
+    games = n_distinct(game_id),
+    max_s = max(s),
+    max_dis = max(dis),
+    .groups = "drop"
+  ) |>
+  slice_max(rows, n = 5) |>
+  gt() |>
+  fmt_number(columns = c(max_s, max_dis), decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-note appearance="simple"}
+
+A whole-play exclusion rule discards a 60-frame play for a single bad frame,
+which is heavy-handed if the defect sits outside the interval actually being
+measured. Section 4.1 scopes the rule against the snap-to-throw window.
+
+:::
+
+## 2.3 Key uniqueness and ball coverage
+
+Every downstream distance calculation assumes one row per player per frame. A
+silent duplicate would not error; it would quietly double-weight a player in
+any per-frame aggregate.
+
+The raw week files contain exactly-duplicated player rows on a small number of
+plays. `02_build_canonical.R` removes them with a full-row `distinct()` and
+asserts on the key afterwards, and `03_build_play_index.R` re-checks the key
+across the whole processed dataset. This section is a tripwire rather than a
+discovery: a nonzero count means the deduplication regressed.
+
+```{r}
+#| label: key-uniqueness
+
+tibble(
+  check = c(
+    "plays with duplicate (play, player, frame) keys",
+    "plays with internal frame gaps",
+    "player-plays not gapless"
+  ),
+  n = c(
+    sum(play_index$has_duplicate_rows),
+    sum(play_index$n_gapped > 0),
+    sum(!player_play$gapless)
+  )
+) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Ball rows carry `nfl_id = NA`, so the uniqueness check also covers "exactly one
+ball row per frame". What it does not cover is plays where the ball is missing
+entirely, or present for only part of the play.
+
+```{r}
+#| label: ball-coverage
+
+play_index |>
+  count(ball_status, sort = TRUE) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.01)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+`n_ball_frames` counts distinct frames, so duplicate ball rows would not
+inflate it. "More ball frames than play frames" is therefore a genuine span
+difference: the ball is tracked on frames where no player is.
+
+## 2.4 Missingness
+
+Split by `is_ball`, because ball rows legitimately have no `position`, `route`,
+or `jersey_number`. Pooling the two makes a structural blank look like a data
+defect and hides real defects behind it.
+
+```{r}
+#| label: missingness
+
+na_cols <- c(
+  "nfl_id",
+  "display_name",
+  "position",
+  "jersey_number",
+  "team_abbr",
+  "side",
+  "x",
+  "y",
+  "s",
+  "a",
+  "dis",
+  "o",
+  "dir",
+  "event",
+  "route",
+  "time",
+  "play_direction"
+)
+
+trk |>
+  group_by(is_ball) |>
+  summarize(
+    across(all_of(na_cols), ~ sum(is.na(.x))),
+    n_rows = n(),
+    .groups = "drop"
+  ) |>
+  collect() |>
+  pivot_longer(all_of(na_cols), names_to = "column", values_to = "n_missing") |>
+  mutate(
+    pct_missing = n_missing / n_rows,
+    row_type = if_else(is_ball, "ball", "player")
+  ) |>
+  select(column, row_type, n_missing, pct_missing) |>
+  pivot_wider(names_from = row_type, values_from = c(n_missing, pct_missing)) |>
+  arrange(desc(pct_missing_player)) |>
+  gt() |>
+  fmt_percent(columns = starts_with("pct_"), decimals = 2) |>
+  fmt_number(columns = starts_with("n_missing"), decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+`team_abbr` has no missing values among player rows, and `side` has none either
+now that `02_build_canonical.R` asserts on it. Both matter for 2.5. The nonzero
+`dir` and `o` counts matter for 2.6, where an unguarded `median()` over them
+returns `NA`.
+
+The same audit on the play table, which is small enough to do in one pass.
+
+```{r}
+#| label: missingness-plays
+
+plays |>
+  summarize(across(everything(), ~ sum(is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "column", values_to = "n_missing") |>
+  filter(n_missing > 0) |>
+  mutate(pct_missing = n_missing / nrow(plays)) |>
+  arrange(desc(n_missing)) |>
+  gt() |>
+  fmt_percent(columns = pct_missing, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+`absolute_yardline_number`, `los_x`, `game_clock`, `type_dropback`, and both
+pre-snap score columns are missing on an identical count of plays. That is one
+coherent block of play-level metadata rather than several independent gaps; 2.6
+tests whether the block is outcome-neutral.
+
+## 2.5 Side assignment
+
+Section 1.3 found plays with zero offensive players tracked. The first
+hypothesis was a fallthrough in how `side` was derived:
+
+```r
+side = case_when(
+  is_ball ~ "ball",
+  team_abbr == possession_team ~ "offense",
+  TRUE ~ "defense"
+)
+```
+
+If either `team_abbr` or `possession_team` were `NA`, the middle condition would
+evaluate to `NA`, fall through, and label the row `"defense"` — everything
+unresolvable silently becoming a defender. Three checks reject that hypothesis:
+`team_abbr` has no missing values (2.4), the abbreviation vocabularies agree
+exactly, and every suspect play's `possession_team` matches one of its own two
+teams. The fallthrough cannot fire, so the cause is elsewhere. The derivation in
+`02_build_canonical.R` now carries an explicit `NA` branch and an assertion
+anyway, which converts a silent failure mode into a loud one for future
+rebuilds.
+
+```{r}
+#| label: suspect-sides
+
+suspect_sides <- play_index |>
+  filter(n_offense == 0 | n_offense > 6 | n_defense == 0) |>
+  left_join(
+    plays |>
+      select(
+        game_id,
+        play_id,
+        possession_team,
+        home_team,
+        away_team,
+        offense_formation,
+        play_description
+      ),
+    by = c("game_id", "play_id")
+  )
+
+suspect_sides |>
+  count(n_offense, n_defense, sort = TRUE) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: team-vocabulary
+
+# The abbreviation vocabularies must agree exactly or the == comparison fails
+# for every play involving the mismatched franchise.
+poss_teams <- sort(unique(plays$possession_team))
+game_teams_vocab <- sort(unique(c(plays$home_team, plays$away_team)))
+
+tibble(
+  direction = c(
+    "in possession_team, not in games",
+    "in games, not in possession_team"
+  ),
+  values = c(
+    paste0(setdiff(poss_teams, game_teams_vocab), collapse = ", "),
+    paste0(setdiff(game_teams_vocab, poss_teams), collapse = ", ")
+  )
+) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: side-mismatch-detail
+
+# A play whose possession_team matches neither of its own two teams would be
+# unassignable regardless of vocabulary overlap.
+suspect_sides |>
+  mutate(
+    poss_matches_a_team = possession_team == home_team |
+      possession_team == away_team
+  ) |>
+  count(n_offense == 0, poss_matches_a_team) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+### What the zero-offense plays actually are
+
+With the fallthrough ruled out, the discriminating test is geometric. Offense
+lines up behind the line of scrimmage — 2.6 puts the median offensive
+$x_{\text{rel}}$ at about $-1.9$ yd — while defenders line up in front of it. A
+tracked group sitting behind the LOS and containing a quarterback would be the
+offense mislabeled, meaning `possessionTeam` is wrong for that play. A group
+sitting downfield with no quarterback is genuinely the defense, with the offense
+simply unrecorded.
+
+```{r}
+#| label: zero-offense-geometry
+
+zero_offense_keys <- play_index |>
+  filter(n_offense == 0) |>
+  select(game_id, play_id)
+
+zero_offense_geom <- trk |>
+  filter(!is_ball, event == "ball_snap") |>
+  select(game_id, play_id, nfl_id, position, team_abbr, x) |>
+  collect() |>
+  cast_keys() |>
+  inner_join(zero_offense_keys, by = c("game_id", "play_id")) |>
+  left_join(
+    plays |>
+      select(game_id, play_id, los_x, possession_team, home_team, away_team),
+    by = c("game_id", "play_id")
+  ) |>
+  mutate(x_rel = x - los_x) |>
+  group_by(game_id, play_id, possession_team, home_team, away_team) |>
+  summarize(
+    n_tracked = n(),
+    tracked_team = paste(sort(unique(team_abbr)), collapse = "/"),
+    median_x_rel = median(x_rel, na.rm = TRUE),
+    has_qb = any(position == "QB"),
+    positions = paste(sort(unique(position)), collapse = " "),
+    .groups = "drop"
+  )
+
+zero_offense_geom |>
+  select(
+    game_id,
+    play_id,
+    n_tracked,
+    tracked_team,
+    possession_team,
+    median_x_rel,
+    has_qb,
+    positions
+  ) |>
+  gt() |>
+  fmt_number(columns = median_x_rel, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: zero-offense-verdict
+
+zero_offense_geom |>
+  mutate(
+    reading = case_when(
+      has_qb & median_x_rel < 0 ~ "offense mislabeled (possessionTeam wrong)",
+      !has_qb & median_x_rel > 0 ~ "offense genuinely untracked",
+      .default = "ambiguous - inspect individually"
+    )
+  ) |>
+  count(reading, sort = TRUE) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Every one of these plays reads as a genuine tracking gap: no quarterback, and
+players positioned downfield of the line of scrimmage. `possessionTeam` is not
+mislabeled anywhere in the dataset and the `side` derivation is working. These
+plays exit the sample at `keep_sides` in 4.2.
+
+Plays with a full complement of offensive players are the candidate mirror image
+of the same defect.
+
+```{r}
+#| label: full-offense-plays
+
+play_index |>
+  filter(n_offense >= 10) |>
+  left_join(
+    player_play |>
+      filter(side == "offense") |>
+      group_by(game_id, play_id) |>
+      summarize(
+        positions = paste(sort(unique(position)), collapse = " "),
+        .groups = "drop"
+      ),
+    by = c("game_id", "play_id")
+  ) |>
+  select(game_id, play_id, n_offense, n_defense, positions) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Section 1.2 qualifies the no-linemen claim. Quantify the exception rather than
+leaving it as prose.
+
+```{r}
+#| label: lineman-exceptions
+
+player_play |>
+  filter(side == "offense") |>
+  count(position, sort = TRUE) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.01)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Defensive-line and secondary positions appearing on the offensive side are
+partly legitimate — teams do line defensive tackles up as goal-line blockers —
+and partly the full-offense plays above. The two tables together say which.
+
+## 2.6 Direction convention and standardization
+
+`R/viz.R` asserts that `dir` is measured in degrees clockwise from $+y$, so that
+
+$$v_x = s \sin(\text{dir} \cdot \pi/180), \qquad v_y = s \cos(\text{dir} \cdot \pi/180)$$
+
+That assertion lives in a code comment. Testing it against observed displacement
+makes it a result, and the same test catches corrupt frames.
+
+Frame-to-frame differencing needs `lag()`, which Arrow will not push down, so
+this runs on a random sample of plays rather than all 18.3M rows.
+
+```{r}
+#| label: convention-sample
+
+set.seed(1961)
+
+conv_keys <- play_index |>
+  slice_sample(n = 300) |>
+  select(game_id, play_id)
+
+conv <- trk |>
+  filter(!is_ball) |>
+  select(game_id, play_id, nfl_id, frame_id, x, y, s, dis, dir) |>
+  collect() |>
+  cast_keys() |>
+  inner_join(conv_keys, by = c("game_id", "play_id")) |>
+  arrange(game_id, play_id, nfl_id, frame_id) |>
+  group_by(game_id, play_id, nfl_id) |>
+  mutate(
+    contiguous = frame_id == lag(frame_id) + 1,
+    dx = x - lag(x),
+    dy = y - lag(y)
+  ) |>
+  ungroup() |>
+  filter(contiguous) |>
+  mutate(
+    displacement = sqrt(dx^2 + dy^2),
+    rad = dir * pi / 180,
+    step = s / TRACKING_HZ,
+    # A: dir clockwise from +y  (the convention viz.R assumes)
+    err_a = sqrt((step * sin(rad) - dx)^2 + (step * cos(rad) - dy)^2),
+    # B: dir counterclockwise from +x  (the plausible alternative)
+    err_b = sqrt((step * cos(rad) - dx)^2 + (step * sin(rad) - dy)^2)
+  )
+```
+
+```{r}
+#| label: convention-verdict
+
+# na.rm is required: dir carries missing values (2.4), and without it both
+# medians return NA and the test produces no verdict.
+conv |>
+  summarize(
+    n_frame_pairs = sum(!is.na(err_a)),
+    n_dropped_na_dir = sum(is.na(err_a)),
+    `median |displacement - dis|` = median(
+      abs(displacement - dis),
+      na.rm = TRUE
+    ),
+    `cor(displacement, s/10)` = cor(displacement, step, use = "complete.obs"),
+    `median err, dir from +y` = median(err_a, na.rm = TRUE),
+    `median err, dir from +x` = median(err_b, na.rm = TRUE)
+  ) |>
+  pivot_longer(everything(), names_to = "statistic") |>
+  gt() |>
+  fmt_number(columns = value, decimals = 4) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+The separation is decisive rather than marginal. Measuring `dir` from $+y$ lands
+at the rounding scale of the source data, while measuring from $+x$ lands at the
+step length itself ($\approx 0.28$ yd at the median), because the wrong
+convention reflects the predicted step about the $45°$ line. `viz.R` is right,
+and the $|\text{displacement} - \text{dis}|$ figure sitting at $\approx 0.01$ yd
+rules out a coordinate transform bug at the same time.
+
+### Missing line of scrimmage
+
+Standardization is the other assertion worth proving, but `los_x` is needed to
+express position relative to the line of scrimmage and 2.4 showed it missing on
+a block of plays. Characterize that block first.
+
+```{r}
+#| label: los-missingness
+
+plays |>
+  mutate(
+    na_los = is.na(los_x),
+    na_yardline = is.na(absolute_yardline_number)
+  ) |>
+  count(na_los, na_yardline, play_direction) |>
+  arrange(desc(n)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: los-gap-context
+
+# If los_x is missing, is the play otherwise well-formed?
+plays |>
+  filter(is.na(los_x)) |>
+  count(has_formation = !is.na(offense_formation), pass_result, quarter) |>
+  arrange(desc(n)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: los-missing-bias
+
+plays |>
+  mutate(los_missing = if_else(is.na(los_x), "los missing", "los present")) |>
+  count(los_missing, pass_result) |>
+  group_by(los_missing) |>
+  mutate(share = n / sum(n)) |>
+  ungroup() |>
+  select(pass_result, los_missing, share) |>
+  pivot_wider(names_from = los_missing, values_from = share, values_fill = 0) |>
+  mutate(difference = `los missing` - `los present`) |>
+  arrange(desc(abs(difference))) |>
+  gt() |>
+  fmt_percent(columns = -pass_result, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-warning appearance="simple"}
+
+Recorded in `notes/decisions.md`: the missing-LOS block runs roughly 72%
+incomplete against a 31% baseline, so excluding it is not missing-at-random with
+respect to outcome. Any outcome model fit on the retained sample carries that
+selection, and the Methods section states its direction and magnitude.
+
+:::
+
+### Rotation, not reflection
+
+`standardize_direction()` rotates left-moving plays by $180°$ by reflecting
+*both* $x$ and $y$. Flipping only $x$ would mirror the field, swapping offensive
+left and right while producing output that looks entirely plausible. The
+signature of that bug is a $y$ distribution that splits by `play_direction`
+while $x$ looks fine.
+
+```{r}
+#| label: snap-positions
+
+snap_offense <- trk |>
+  filter(!is_ball, side == "offense", event == "ball_snap") |>
+  select(game_id, play_id, nfl_id, x, y) |>
+  collect() |>
+  cast_keys() |>
+  left_join(
+    plays |> select(game_id, play_id, los_x, play_direction),
+    by = c("game_id", "play_id")
+  ) |>
+  mutate(x_rel = x - los_x)
+```
+
+```{r}
+#| label: standardization-check
+
+snap_offense |>
+  summarize(
+    player_plays = n(),
+    missing_x = sum(is.na(x)),
+    missing_y = sum(is.na(y)),
+    missing_los = sum(is.na(los_x)),
+    usable = sum(!is.na(x_rel) & !is.na(y)),
+    pct_usable = usable / player_plays
+  ) |>
+  gt() |>
+  fmt_percent(columns = pct_usable, decimals = 2) |>
+  fmt_number(columns = -pct_usable, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: standardization-quantiles
+
+std_long <- snap_offense |>
+  select(play_direction, x_rel, y) |>
+  pivot_longer(c(x_rel, y), names_to = "axis") |>
+  filter(!is.na(value), !is.na(play_direction))
+
+std_long |>
+  group_by(axis, play_direction) |>
+  summarize(
+    n = n(),
+    p10 = quantile(value, 0.10),
+    p50 = quantile(value, 0.50),
+    p90 = quantile(value, 0.90),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  fmt_number(columns = starts_with("p"), decimals = 2) |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: standardization-plot
+#| fig-height: 3.5
+
+std_long |>
+  ggplot(aes(value, colour = play_direction)) +
+  stat_ecdf(linewidth = 0.7) +
+  facet_wrap(~axis, scales = "free_x") +
+  labs(
+    title = "Offensive positions at snap, by original play direction",
+    subtitle = "Correct rotation: the two curves coincide on both axes",
+    x = "yards",
+    y = "ECDF",
+    colour = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+The curves coincide on both axes, so the transform is a rotation. Compare the
+quantiles, not a test statistic: at $n \approx 10^5$ per group a two-sample KS
+test rejects on differences far too small to matter, so the $p$-value carries no
+information here.
+
+## 2.7 Join integrity
+
+Arrow stores integer keys as `int64`, while a locally constructed frame may hold
+`integer` or `double`. A type mismatch on the join key produces zero matches
+rather than an error. `cast_keys()` in `R/utils.R` now casts every identifier to
+`int32` at the point of collection, so the whole processed layer shares one key
+type and the mismatch cannot arise.
+
+These five checks are asserted in `03_build_play_index.R`, which warns on
+failure. Re-displayed here because a build-time assertion nobody sees is not a
+finding.
+
+```{r}
+#| label: join-integrity
+
+tibble(
+  check = c(
+    "tracking nfl_id absent from players",
+    "players never appearing in tracking",
+    "tracking plays absent from plays table",
+    "plays table entries absent from tracking",
+    "plays with zero tracked players",
+    "duplicated play keys in play_index"
+  ),
+  n = c(
+    nrow(anti_join(
+      distinct(player_play, nfl_id),
+      distinct(players, nfl_id),
+      by = "nfl_id"
+    )),
+    nrow(anti_join(
+      distinct(players, nfl_id),
+      distinct(player_play, nfl_id),
+      by = "nfl_id"
+    )),
+    nrow(anti_join(
+      distinct(play_index, game_id, play_id),
+      distinct(plays, game_id, play_id),
+      by = c("game_id", "play_id")
+    )),
+    nrow(anti_join(
+      distinct(plays, game_id, play_id),
+      distinct(play_index, game_id, play_id),
+      by = c("game_id", "play_id")
+    )),
+    sum(play_index$n_players == 0),
+    sum(duplicated(play_index[c("game_id", "play_id")]))
+  )
+) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+All six checks return zero. `players.parquet` contains exactly the players who
+appear in tracking, so the player join is complete in both directions, and the
+play and game keys agree across all three tables.
+
+# 3. Trajectory
+
+Everything in the coverage, route, separation, and decision-timing space is
+anchored to events. Nothing in sections 1 and 2 has touched them.
+
+## 3.1 Event vocabulary
+
+The `event` column is populated on every row of the frame in which the event
+occurs, so `play_events.parquet` is deduplicated to one row per
+(play, frame, event).
+
+```{r}
+#| label: event-vocabulary
+
+play_events |>
+  distinct(game_id, play_id, event) |>
+  count(event, name = "plays") |>
+  left_join(count(play_events, event, name = "frames"), by = "event") |>
+  mutate(pct_of_plays = percent(plays / nrow(play_index), accuracy = 0.1)) |>
+  arrange(desc(plays)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+## 3.2 Event presence per play
+
+`play_index` carries `f_<event>` for the first frame of each anchor event, and
+`n_ev_<event>` for the multiplicity of the three anchors where multiplicity
+matters.
+
+```{r}
+#| label: event-frames
+
+play_index |>
+  summarize(across(starts_with("f_"), ~ sum(!is.na(.x)))) |>
+  pivot_longer(everything(), names_to = "event", values_to = "plays") |>
+  mutate(
+    event = str_remove(event, "^f_"),
+    pct = percent(plays / nrow(play_index), accuracy = 0.1)
+  ) |>
+  arrange(desc(plays)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+A play with no `ball_snap` has no time origin. A play with no `pass_forward` is
+a sack, a scramble, or a penalty-aborted snap: a population to define
+explicitly, not to leave implicit.
+
+```{r}
+#| label: missing-throw-reason
+
+play_context |>
+  mutate(
+    has_snap = !is.na(f_ball_snap),
+    has_throw = !is.na(f_pass_forward)
+  ) |>
+  count(has_snap, has_throw, pass_result) |>
+  arrange(desc(n)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+### What the no-throw plays are
+
+`keep_any_throw` is the largest single exclusion in the funnel, so its
+composition determines whether it is attrition or a population definition.
+
+```{r}
+#| label: no-throw-composition
+
+sample_flags |>
+  filter(apply_flags(sample_flags, c("keep_live_play", "keep_snap"))) |>
+  filter(!keep_any_throw) |>
+  count(pass_result, sort = TRUE) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.1)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-important appearance="simple"}
+
+The no-throw block is overwhelmingly sacks (`pass_result == "S"`), consistent
+with league-wide 2018 sack totals. `keep_any_throw` is therefore a *population
+definition* — plays where a forward pass was released — rather than a
+data-quality exclusion, and it is grouped as such in 4.2. The handful of
+non-sack residuals are recorded pass attempts with no throw event of any kind:
+either penalty-nullified or event-labeling gaps. Recorded in
+`notes/decisions.md`.
+
+:::
+
+The mirror-image check: a sack that *does* carry a throw event would survive
+into the sample as a pass attempt.
+
+```{r}
+#| label: sacks-surviving
+
+analytic_sample |>
+  count(pass_result, throw_anchor) |>
+  pivot_wider(
+    names_from = throw_anchor,
+    values_from = n,
+    values_fill = 0
+  ) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+### Non-standard throw anchors
+
+Some completions and incompletions have no `pass_forward` event at all. The
+forward pass on those plays is recorded under a different label, so a
+`pass_forward`-only anchor discards real passes as though they were sacks.
+
+```{r}
+#| label: alternate-throw-anchor
+
+play_context |>
+  filter(is.na(f_pass_forward), pass_result %in% c("C", "I", "IN")) |>
+  mutate(recoverable = !is.na(f_pass_shovel) | !is.na(f_pass_lateral)) |>
+  count(pass_result, recoverable) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+`keep_any_throw` in 4.2 accepts `pass_shovel` and recovers those plays.
+`f_throw` in `analytic_sample.parquet` resolves the precedence once, in the same
+place the rule accepted it, so no downstream file re-derives it.
+
+## 3.3 Decision timing
+
+$$t_{\text{throw}} = \frac{f_{\text{throw}} - f_{\text{ball\_snap}}}{10}$$
+
+```{r}
+#| label: duplicate-anchors
+
+# min() silently takes the first of several. Where a play has more than one
+# forward pass, "first" may be the wrong one.
+play_context |>
+  select(game_id, play_id, pass_result, starts_with("n_ev_")) |>
+  pivot_longer(
+    starts_with("n_ev_"),
+    names_to = "event",
+    values_to = "occurrences"
+  ) |>
+  filter(occurrences > 1) |>
+  mutate(event = str_remove(event, "^n_ev_")) |>
+  count(event, pass_result) |>
+  pivot_wider(names_from = pass_result, values_from = n, values_fill = 0) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: timing
+
+timing <- play_context |>
+  mutate(f_throw = coalesce(f_pass_forward, f_pass_shovel)) |>
+  filter(!is.na(f_ball_snap), !is.na(f_throw)) |>
+  mutate(
+    t_throw = (f_throw - f_ball_snap) / TRACKING_HZ,
+    t_arrive = (f_pass_arrived - f_ball_snap) / TRACKING_HZ,
+    t_flight = (f_pass_arrived - f_throw) / TRACKING_HZ,
+    frames_pre_snap = f_ball_snap - first_frame,
+    frames_post_throw = last_frame - f_throw
+  )
+```
+
+```{r}
+#| label: time-to-throw
+
+timing |>
+  summarize(
+    across(
+      c(t_throw, t_arrive, t_flight),
+      list(
+        n = ~ sum(!is.na(.x)),
+        p05 = ~ quantile(.x, 0.05, na.rm = TRUE),
+        p50 = ~ quantile(.x, 0.50, na.rm = TRUE),
+        p95 = ~ quantile(.x, 0.95, na.rm = TRUE),
+        min = ~ min(.x, na.rm = TRUE),
+        max = ~ max(.x, na.rm = TRUE)
+      )
+    )
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = c("quantity", ".value"),
+    names_pattern = "^(t_[a-z]+)_(.*)$"
+  ) |>
+  gt() |>
+  fmt_number(columns = -c(quantity, n), decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: time-to-throw-dist
+#| fig-height: 3.5
+
+timing |>
+  filter(between(t_throw, 0, 10)) |>
+  ggplot(aes(t_throw)) +
+  geom_histogram(binwidth = 0.1, fill = "lightsteelblue3") +
+  labs(
+    title = "Time from snap to forward pass",
+    subtitle = paste0(
+      "n = ",
+      comma(sum(between(timing$t_throw, 0, 10), na.rm = TRUE)),
+      " plays; truncated at 10 s"
+    ),
+    x = "seconds",
+    y = "plays"
+  ) +
+  theme_minimal()
+```
+
+Negative or zero `t_throw` values are impossible and indicate event-ordering
+problems rather than fast decisions.
+
+```{r}
+#| label: timing-anomalies
+
+timing |>
+  summarize(
+    `t_throw <= 0` = sum(t_throw <= 0, na.rm = TRUE),
+    `t_throw > 10 s` = sum(t_throw > 10, na.rm = TRUE),
+    `t_flight < 0` = sum(t_flight < 0, na.rm = TRUE),
+    `arrival before throw` = sum(f_pass_arrived < f_throw, na.rm = TRUE),
+    `no pre-snap frames` = sum(frames_pre_snap <= 0, na.rm = TRUE)
+  ) |>
+  pivot_longer(everything(), names_to = "anomaly", values_to = "plays") |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+## 3.4 Observation window
+
+How much usable tracking sits on either side of the throw. This sets the
+feasible lag and lead for any time-indexed feature.
+
+```{r}
+#| label: observation-window
+
+timing |>
+  select(frames_pre_snap, frames_post_throw) |>
+  pivot_longer(everything(), names_to = "window") |>
+  group_by(window) |>
+  summarize(
+    p05 = quantile(value, 0.05, na.rm = TRUE),
+    p50 = quantile(value, 0.50, na.rm = TRUE),
+    p95 = quantile(value, 0.95, na.rm = TRUE),
+    `seconds at p05` = p05 / TRACKING_HZ,
+    .groups = "drop"
+  ) |>
+  gt() |>
+  fmt_number(columns = -window, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: pre-snap-constant
+
+# p05, p50, and p95 coincide, so the pre-snap window is a structural constant
+# rather than a distribution. Confirm directly.
+timing |>
+  count(frames_pre_snap, sort = TRUE) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.1)) |>
+  slice_head(n = 6) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-important appearance="simple"}
+
+The pre-snap window is fixed at 10 frames on over 99% of plays — exactly $1.0$
+s. Every pre-snap feature, whether alignment, leverage, or motion detection, has
+that and no more, and no amount of filtering buys extra. Recorded in
+`notes/decisions.md`.
+
+:::
+
+## 3.5 Targeted receiver
+
+```{r}
+#| label: targets
+
+play_context |>
+  mutate(has_target = !is.na(target_nfl_id)) |>
+  count(pass_result, has_target) |>
+  pivot_wider(
+    names_from = has_target,
+    values_from = n,
+    values_fill = 0,
+    names_prefix = "target_"
+  ) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+A target is only usable if that player is actually tracked on the play, which
+`03_build_play_index.R` resolves as `target_tracked`.
+
+```{r}
+#| label: target-tracked
+
+play_index |>
+  filter(!is.na(target_nfl_id)) |>
+  count(target_tracked) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.1)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+A non-missing `target_nfl_id` is therefore not sufficient. `keep_target` in 4.3
+requires the target to be both named and tracked.
+
+## 3.6 Route coverage
+
+`route` is populated only for eligible receivers, so the NA rate is structural
+for some positions and a defect for others. It is `NA` for every defender, so
+`n_routes` in the index is an offense-only count without needing a side filter.
+
+```{r}
+#| label: route-coverage
+
+player_play |>
+  filter(side == "offense") |>
+  group_by(position) |>
+  summarize(
+    player_plays = n(),
+    with_route = sum(!is.na(route)),
+    pct_with_route = with_route / player_plays,
+    .groups = "drop"
+  ) |>
+  arrange(desc(player_plays)) |>
+  gt() |>
+  fmt_percent(columns = pct_with_route, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: route-vocabulary
+
+player_play |>
+  filter(!is.na(route)) |>
+  count(route, sort = TRUE) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.1)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: routes-per-play
+
+play_index |>
+  count(n_routes) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.1)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: zero-route-plays
+
+# Sacks explain some zero-route plays. Anything left over is a gap in the route
+# labels on plays where a pass was actually thrown.
+zero_route <- play_context |>
+  filter(n_routes == 0) |>
+  mutate(f_throw = coalesce(f_pass_forward, f_pass_shovel))
+
+zero_route |>
+  count(pass_result, has_throw = !is.na(f_throw)) |>
+  arrange(desc(n)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+The thrown-pass subset of these is enriched in incompletions at roughly the same
+rate as the missing-LOS block in 2.6. Two degraded blocks of similar size and
+similar outcome skew are more likely one block than two, which is testable.
+
+```{r}
+#| label: route-los-overlap
+
+los_missing_keys <- plays |>
+  filter(is.na(los_x)) |>
+  select(game_id, play_id)
+
+zero_route_thrown <- zero_route |>
+  filter(!is.na(f_throw)) |>
+  select(game_id, play_id)
+
+tibble(
+  quantity = c(
+    "plays missing los_x",
+    "plays with a throw and no route labels",
+    "in both sets",
+    "zero-route plays surviving keep_los"
+  ),
+  n = c(
+    nrow(los_missing_keys),
+    nrow(zero_route_thrown),
+    nrow(inner_join(
+      los_missing_keys,
+      zero_route_thrown,
+      by = c("game_id", "play_id")
+    )),
+    nrow(anti_join(
+      zero_route_thrown,
+      los_missing_keys,
+      by = c("game_id", "play_id")
+    ))
+  )
+) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+The last row is what matters. Near zero means `keep_los` already removes the
+route gap and no separate exclusion is needed. A large value means a second
+non-ignorable gap that any route-conditioned framing has to handle on its own.
+
+## 3.7 Coverage label availability
+
+This is the binding constraint on any coverage-framed question.
+
+`coverages_week1.parquet` carries the original eight labels verbatim. Collapsing
+them to a man/zone binary is a modeling decision, so it lives in
+`classify_coverage()` in `R/coverage.R` and is applied at the sample layer
+rather than baked into the data.
+
+```{r}
+#| label: coverage-availability
+
+coverage_join <- plays |>
+  select(game_id, play_id, week, pass_result, offense_formation, personnel_d) |>
+  left_join(
+    coverages |> select(game_id, play_id, coverage),
+    by = c("game_id", "play_id")
+  ) |>
+  mutate(coverage_class = classify_coverage(coverage))
+
+tibble(
+  quantity = c(
+    "plays in dataset",
+    "plays with a coverage label",
+    "share of dataset labeled",
+    "weeks represented among labeled plays"
+  ),
+  value = c(
+    comma(nrow(coverage_join)),
+    comma(sum(!is.na(coverage_join$coverage))),
+    percent(mean(!is.na(coverage_join$coverage)), accuracy = 0.1),
+    as.character(n_distinct(coverage_join$week[!is.na(coverage_join$coverage)]))
+  )
+) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: coverage-class-mapping
+
+coverage_join |>
+  filter(!is.na(coverage)) |>
+  count(coverage_class, coverage) |>
+  arrange(coverage_class, desc(n)) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.1)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Eight labels with a minimum cell of one play cannot support an eight-class
+model, so `classify_coverage()` collapses them to the man/zone binary.
+`Prevent Zone` is the one label mapped to `NA` rather than to a class: a single
+garbage-time play, and a description of game state rather than of scheme. It
+drops out of any coverage-conditional sample. The precedence is explicit —
+`Man` is tested before `Zone` — so a future label containing both words
+classifies as man rather than depending on `case_when()` ordering.
+
+```{r}
+#| label: coverage-by-outcome
+
+coverage_join |>
+  filter(!is.na(coverage_class)) |>
+  count(coverage_class, pass_result) |>
+  pivot_wider(names_from = pass_result, values_from = n, values_fill = 0) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+# 4. Sample Definition
+
+The rule lives in `R/sample_rules.R` and is applied by
+`scripts/04_build_sample.R`. This section reports it.
+
+## 4.1 Scoping the kinematic exclusion
+
+A whole-play rule discards a play for a defect anywhere in it. Only the
+snap-to-throw interval feeds a separation or timing measurement, so
+`03_build_play_index.R` locates each defective row relative to that window.
+
+```{r}
+#| label: defect-window
+
+defects |>
+  count(position_in_play, sort = TRUE) |>
+  mutate(pct = percent(n / sum(n), accuracy = 0.1)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: defect-window-plays
+
+play_index |>
+  filter(has_kinematic_defect) |>
+  count(defect_in_window) |>
+  mutate(
+    interpretation = if_else(
+      defect_in_window,
+      "must exclude: defect inside the measurement window",
+      "recoverable: defect outside the measurement window"
+    )
+  ) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-important appearance="simple"}
+
+**Decision: the scoped rule.** A play is excluded only when a defective row
+falls between the snap and the throw. The majority of defective rows land after
+the throw, so a whole-play rule would discard hundreds of plays whose
+measurement window is clean.
+
+The cost is that retained plays may contain uncleaned frames outside the window,
+which the Methods section must state. `has_kinematic_defect` and
+`defect_in_window` travel with the persisted sample so any model can test
+sensitivity to this choice without rebuilding the funnel. The conservative rule
+is reported alongside in 4.2 as the comparison.
+
+:::
+
+## 4.2 Attrition funnel
+
+Each filter is tied to a *named defect* rather than to `n_players`, which would
+select on defensive scheme rather than on data quality.
+
+The flags are split into two blocks, and the ordering matters for
+interpretation. **Population** filters define which plays are in scope at all:
+live plays where a quarterback released a forward pass. **Quality** filters
+identify plays that are in scope but cannot be measured. Conjunction is
+order-independent, so the surviving count is the same under any ordering; what
+running population first buys is that each quality step's `dropped` reads as
+"plays I wanted but cannot use" rather than being inflated by plays that were
+never in scope.
+
+```{r}
+#| label: funnel-scoped
+
+sample_funnel |>
+  filter(rule == "scoped") |>
+  select(group, step, dropped, remaining, pct_of_start) |>
+  gt(groupname_col = "group") |>
+  fmt_percent(columns = pct_of_start, decimals = 1) |>
+  fmt_number(columns = c(dropped, remaining), decimals = 0) |>
+  sub_missing(missing_text = "—") |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: funnel-marginals
+
+# The funnel's `dropped` is conditional on the preceding steps. These are the
+# unconditional counts. The missing-LOS block is larger than the number of
+# plays the funnel attributes to keep_los, because some of those plays were
+# already out on population grounds.
+flag_marginals(sample_flags) |>
+  arrange(group, desc(n_failing)) |>
+  select(group, criterion, n_failing, pct_failing) |>
+  gt(groupname_col = "group") |>
+  fmt_percent(columns = pct_failing, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: funnel-rule-comparison
+
+# The two rules differ at exactly two steps: the throw anchor and the kinematic
+# scope. Everything else is shared, so the comparison is the final count plus
+# those two rows.
+sample_funnel |>
+  filter(flag %in% c(
+    "keep_any_throw",
+    "keep_throw",
+    "keep_clean_window",
+    "keep_clean_kin"
+  )) |>
+  select(rule, step, dropped, remaining) |>
+  bind_rows(
+    sample_funnel |>
+      group_by(rule) |>
+      slice_max(step_index, n = 1) |>
+      ungroup() |>
+      transmute(rule, step = "FINAL", dropped = NA_integer_, remaining)
+  ) |>
+  gt(groupname_col = "rule") |>
+  fmt_number(columns = c(dropped, remaining), decimals = 0) |>
+  sub_missing(missing_text = "—") |>
+  gt_theme_538(quiet = TRUE)
+```
+
+`keep_no_dupes` drops zero plays, since `02_build_canonical.R` deduplicates
+upstream. The row stays in the funnel as the tripwire described in 2.3: a
+nonzero count means the cleaning step regressed.
+
+## 4.3 Sample size under each candidate question
+
+Same base sample, three different question framings. The point of this table is
+to make the cost of each framing explicit before committing to one.
+
+```{r}
+#| label: funnel-candidates
+
+candidates <- list(
+  `A. Decision timing (all weeks)` = SAMPLE_RULE,
+  `B. Separation at throw, targeted receiver` = c(SAMPLE_RULE, "keep_target"),
+  `C. Coverage-conditional separation` = c(
+    SAMPLE_RULE,
+    "keep_target",
+    "keep_coverage"
+  )
+)
+
+imap(candidates, \(flags, nm) {
+  keep <- apply_flags(sample_flags, flags)
+  tibble(
+    question = nm,
+    plays = sum(keep),
+    pct_of_start = mean(keep),
+    weeks = n_distinct(sample_flags$week[keep])
+  )
+}) |>
+  list_rbind() |>
+  gt() |>
+  fmt_percent(columns = pct_of_start, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: candidate-c-cells
+
+# For question C, the per-class cell counts are what actually limit it.
+keep_c <- apply_flags(sample_flags, candidates[[3]])
+
+sample_flags |>
+  filter(keep_c) |>
+  count(coverage_class, coverage) |>
+  arrange(coverage_class, desc(n)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: candidate-c-binary
+
+sample_flags |>
+  filter(keep_c) |>
+  count(coverage_class, pass_result) |>
+  pivot_wider(names_from = pass_result, values_from = n, values_fill = 0) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-important appearance="simple"}
+
+The open decision: coarse man/zone coverage on the single labeled week, or drop
+coverage as a covariate and use the full-season sample. The three rows of 4.3
+are the whole argument.
+
+The completion-rate difference between man and zone above is descriptive only.
+It is confounded by down, distance, field position, and personnel, and a model
+would have to condition on all of them.
+
+:::
+
+## 4.4 The persisted sample
+
+`scripts/04_build_sample.R` writes `analytic_sample.parquet`. This notebook no
+longer writes it — the sample is a build artifact, not a byproduct of rendering
+a document.
+
+```{r}
+#| label: sample-summary
+
+tibble(
+  quantity = c(
+    "plays retained",
+    "share of all plays",
+    "weeks represented",
+    "plays with a tracked target",
+    "plays with a coverage label",
+    "plays retained only under the scoped rule"
+  ),
+  value = c(
+    comma(nrow(analytic_sample)),
+    percent(nrow(analytic_sample) / nrow(plays), accuracy = 0.1),
+    as.character(n_distinct(analytic_sample$week)),
+    comma(sum(analytic_sample$target_tracked)),
+    comma(sum(!is.na(analytic_sample$coverage_class))),
+    comma(sum(analytic_sample$has_kinematic_defect))
+  )
+) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: sample-by-week
+
+analytic_sample |>
+  count(week) |>
+  left_join(count(plays, week, name = "all_plays"), by = "week") |>
+  mutate(retention = n / all_plays) |>
+  gt() |>
+  fmt_percent(columns = retention, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Retention should be roughly flat across weeks. A week that stands out points at
+a collection artifact concentrated in that week rather than at a property of the
+game.
+
+```{r}
+#| label: sample-columns
+
+tibble(column = names(analytic_sample), type = map_chr(analytic_sample, \(x)
+  class(x)[1])) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+`has_kinematic_defect` and `defect_in_window` travel with the sample rather than
+being filtered away, so a downstream model can test sensitivity to the
+scoped-versus-conservative choice without rebuilding the funnel. Every surviving
+play satisfies `defect_in_window == FALSE`; `has_kinematic_defect == TRUE` marks
+the plays retained under the scoped rule that the conservative rule would have
+dropped.
+
+## 4.5 Not yet filtered
+
+`SAMPLE_RULE` is deliberately question-agnostic: it removes plays that are not
+live, not pass attempts, or not measurable. It does **not** remove play types
+that are measurable but may be inappropriate for a particular question. All of
+the following are currently retained:
+
+- QB spikes — clock management, no intended receiver
+- Throwaways — a real throw with no receiver targeted
+- Screens — legitimate passes, but separation dynamics differ
+- Penalty-nullified plays — real tracking, no official play
+- Batted or tipped passes at the line — outcome set before separation matters
+- Hail Marys — coverage geometry unrelated to the usual model
+- Goal-line plays with extra linemen (1.2)
+
+These are population decisions belonging to a research question, not data-defect
+decisions belonging to the pipeline. The intended approach is to flag them in
+`sample_flags` without filtering, so each candidate question selects its own
+population on top of a shared base. Deferred until the question is settled.
+
+# 5. Where this leaves the project
+
+Decisions taken so far, with counts, are recorded in `notes/decisions.md`, which
+is intended to become the Methods section of the December report. The open items
+are the research question fork and the coverage-label tradeoff in 4.3.

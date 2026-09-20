@@ -1,0 +1,32 @@
+/*-- scss:defaults --*/
+
+// Body text — remove this line if you'd rather keep mainfont in YAML.
+$font-family-sans-serif: "Gotham", -apple-system, BlinkMacSystemFont, sans-serif !default;
+
+
+/*-- scss:rules --*/
+
+// Monospace. Edit this one list; every code context below inherits it.
+// Test with Georgia first — serif code is unmistakable, so you'll know
+// immediately whether the plumbing works before you debug a font name.
+code, kbd, pre, samp,
+pre > code.sourceCode,
+div.sourceCode pre code,
+div.cell-output pre,
+div.cell-output pre code {
+  font-family: "Berkeley Mono", Menlo, Consolas, monospace;
+}
+
+// Fenced blocks
+pre > code.sourceCode {
+  font-size: 1em;
+  line-height: 1.45;
+}
+
+// Inline code — distinguishable from body text without shouting
+code:not(.sourceCode) {
+  font-size: 0.88em;
+  color: #a1273c;
+  background-color: transparent;
+  padding: 0;
+}
