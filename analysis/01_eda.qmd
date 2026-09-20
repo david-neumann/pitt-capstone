@@ -22,6 +22,12 @@ execute:
 ```{r}
 #| label: setup
 #| include: false
+if (Sys.getenv("RENV_PROJECT") == "") {
+  root <- normalizePath("..", mustWork = TRUE)
+  Sys.setenv(RENV_PROJECT = root)
+  setwd(root)
+  source("renv/activate.R")
+}
 
 library(tidyverse)
 library(arrow)
@@ -1741,12 +1747,15 @@ flag_marginals(sample_flags) |>
 # scope. Everything else is shared, so the comparison is the final count plus
 # those two rows.
 sample_funnel |>
-  filter(flag %in% c(
-    "keep_any_throw",
-    "keep_throw",
-    "keep_clean_window",
-    "keep_clean_kin"
-  )) |>
+  filter(
+    flag %in%
+      c(
+        "keep_any_throw",
+        "keep_throw",
+        "keep_clean_window",
+        "keep_clean_kin"
+      )
+  ) |>
   select(rule, step, dropped, remaining) |>
   bind_rows(
     sample_funnel |>
@@ -1885,8 +1894,12 @@ game.
 ```{r}
 #| label: sample-columns
 
-tibble(column = names(analytic_sample), type = map_chr(analytic_sample, \(x)
-  class(x)[1])) |>
+tibble(
+  column = names(analytic_sample),
+  type = map_chr(analytic_sample, \(x) {
+    class(x)[1]
+  })
+) |>
   gt() |>
   gt_theme_538(quiet = TRUE)
 ```

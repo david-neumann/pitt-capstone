@@ -21,6 +21,7 @@ FLAG_LABELS <- c(
   keep_snap = "has a ball_snap event",
   keep_throw = "has a pass_forward event",
   keep_any_throw = "has a pass_forward or pass_shovel event",
+  keep_arrival = "has a pass_arrived event",
   keep_los = "has a line of scrimmage",
   keep_sides = "at least 5 players tracked per side",
   keep_ball = "ball tracked for every frame",
@@ -43,6 +44,7 @@ FLAG_GROUP <- c(
   keep_snap = "population",
   keep_throw = "population",
   keep_any_throw = "population",
+  keep_arrival = "population",
   keep_target = "population",
   keep_coverage = "population",
   keep_los = "quality",
@@ -152,6 +154,7 @@ add_sample_flags <- function(plays, play_index, coverages = NULL) {
       keep_snap = !is.na(f_ball_snap),
       keep_throw = !is.na(f_pass_forward),
       keep_any_throw = !is.na(f_pass_forward) | !is.na(f_pass_shovel),
+      keep_arrival = !is.na(f_pass_arrived),
       keep_los = !is.na(los_x),
       keep_sides = dplyr::coalesce(n_offense, 0L) >= 5 &
         dplyr::coalesce(n_defense, 0L) >= 5,
