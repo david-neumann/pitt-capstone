@@ -45,7 +45,8 @@ stopifnot(
     distinct(plays, game_id, play_id),
     distinct(play_index, game_id, play_id),
     by = c("game_id", "play_id")
-  )) == 0
+  )) ==
+    0
 )
 
 # ---- flags -----------------------------------------------------------
@@ -64,13 +65,15 @@ write_parquet(sample_flags, path(processed, "sample_flags.parquet"))
 
 # ---- funnel ----------------------------------------------------------
 # Both rules, stacked long. The notebook pivots on step_index to show them
-# side by side; the two differ only at step 6.
+# side by side; the two differ only at steps 3 and 8.
 
 sample_funnel <- bind_rows(
   funnel(sample_flags, SCOPED_FLAGS) |> mutate(rule = "scoped"),
   funnel(sample_flags, CONSERVATIVE_FLAGS) |> mutate(rule = "conservative")
 ) |>
-  mutate(is_adopted = identical(SAMPLE_RULE, SCOPED_FLAGS) & rule == "scoped") |>
+  mutate(
+    is_adopted = identical(SAMPLE_RULE, SCOPED_FLAGS) & rule == "scoped"
+  ) |>
   relocate(rule, .before = step_index)
 
 write_parquet(sample_funnel, path(processed, "sample_funnel.parquet"))

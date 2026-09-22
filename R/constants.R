@@ -1,6 +1,6 @@
 # R/constants.R --------------------------------------------------------
 # Field geometry and physical bounds. Single source of truth — sourced by
-# R/standardize.R, R/viz.R, and the build scripts so the numbers can't
+# R/standardize.R, R/viz.R, R/geometry.R and the build scripts so the numbers can't
 # drift apart.
 
 # ---- field geometry, in yards ----------------------------------------
@@ -41,3 +41,19 @@ MAX_SPEED <- 13 # yd/s
 MAX_DIS <- MAX_SPEED / TRACKING_HZ # yd per frame
 
 MAX_ACCEL <- 20 # yd/s^2
+
+# ---- player motion model ---------------------------------------------
+# Inputs to time_to_point() in R/geometry.R. Distinct from MAX_SPEED /
+# MAX_ACCEL above, which are *implausibility* thresholds for flagging
+# corrupt rows. These are attainable-performance estimates.
+#
+# Estimated from the tracking data itself rather than from outside
+# literature: per-player p999 of s and p99 of a, restricted to players
+# with >= 5000 tracked rows and to rows passing the defect thresholds,
+# then the median across players. Query in notes/decisions.md.
+#
+#   s: per-player p999, median across players  9.22   (p90: 9.98)
+#   a: per-player p99,  median across players  5.90   (p90: 6.50)
+
+PLAYER_S_MAX <- 9.22 # yd/s
+PLAYER_A_MAX <- 5.90 # yd/s^2

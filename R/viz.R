@@ -15,6 +15,7 @@ library(dplyr)
 library(gganimate)
 
 source(here::here("R", "constants.R"))
+source(here::here("R", "geometry.R"))
 
 # ---- team colors -----------------------------------------------------
 
@@ -303,16 +304,6 @@ plot_frame <- function(
 }
 
 # ---- animation --------------------------------------------------------
-
-#' Velocity components from speed and direction
-#'
-#' dir is degrees clockwise from +y: dir = 0 -> +y, dir = 90 -> +x. This
-#' is the convention validated by the frame-to-frame displacement check
-#' in notes/decisions.md.
-velocity_xy <- function(s, dir) {
-  rad <- dir * pi / 180
-  list(vx = s * sin(rad), vy = s * cos(rad))
-}
 
 #' Build a gganimate object for one play
 #'
