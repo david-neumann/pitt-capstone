@@ -24,14 +24,6 @@ interim <- here("data", "interim")
 processed <- here("data", "processed")
 dir_create(path(processed, "tracking"))
 
-require_cols <- function(df, cols, what) {
-  missing <- setdiff(cols, names(df))
-  if (length(missing)) {
-    stop(what, " missing expected columns: ", paste0(missing, collapse = ", "))
-  }
-  invisible(df)
-}
-
 # --- games ------------------------------------------------------------
 
 games <- read_parquet(path(interim, "games.parquet")) |>

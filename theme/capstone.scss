@@ -30,3 +30,28 @@ code:not(.sourceCode) {
   background-color: transparent;
   padding: 0;
 }
+
+.reveal table {
+  font-size: 0.68em;
+  margin: 0.4em 0;
+}
+.reveal table th,
+.reveal table td {
+  padding: 0.18em 0.45em;
+}
+.reveal h2 {
+  margin-bottom: 0.5em;
+}
+.reveal ul,
+.reveal ol {
+  margin-bottom: 0.4em;
+}
+.reveal li {
+  margin-bottom: 0.15em;
+}
+.reveal .math.display {
+  margin: 0.4em 0;
+}
+.reveal section.tighter {
+  font-size: 0.85em;
+}

@@ -1,0 +1,166 @@
+---
+title: "NFL BDB 2021: Completion Probability"
+subtitle: "STAT 1961 — Week 5 update"
+author: "David Neumann"
+date: 2026-09-22
+format:
+  revealjs:
+    theme: [default, ../theme/capstone.scss]
+    slide-number: true
+    incremental: false
+    smaller: true
+execute:
+  eval: false
+  echo: false
+---
+
+## Where I left off
+
+**Week 4 was data integrity**
+
+- Duplicate rows, coordinate conventions, tracking anomalies
+- Sample locked: **17,081 of 19,239 plays** (88.8%), all 17 weeks
+
+**Three candidate questions still open** — expected separation, completion
+probability as defender credit, man/zone classification
+
+The plan for this week was to pick one.
+
+::: {.notes}
+Fast. Twenty seconds. The only number that matters here is the sample size.
+:::
+
+## This week
+
+**Pipeline complete**
+
+| Layer | Owns |
+|---|---|
+| `01` mirror | CSV → Parquet, no transformation |
+| `02` canonical | Naming, dedup, coordinate rotation |
+| `03` index | Measured facts, one row per play |
+| `04` sample | Exclusion decisions |
+
+**Helper libraries, tested** 
+
+**Question chosen and scoped**
+
+::: {.notes}
+The point of the table is the last row: no analysis writes data. Don't read it
+aloud.
+:::
+
+## The question
+
+> **Does player tracking improve completion probability beyond what
+> play-by-play already knows?**
+
+$$\Pr(\text{complete} \mid \text{game state at the throw})$$
+
+- Measured at the instant of release, not at arrival
+- Separation is a **feature of this model**, not a separate question
+- Population: targeted receiver, passes beyond the line of scrimmage
+
+::: {.notes}
+"Beyond what play-by-play already knows" is the whole thesis. The next slide is
+why that's a real gap.
+:::
+
+## What public models can already see
+
+nflverse `cp`
+
+| | |
+|---|---|
+| Situation | yard line, down, yards to go, home, roof, era |
+| The throw | air yards, distance to sticks, air yards = 0, pass down the middle (y/n) |
+| Pressure | QB hit on the play |
+
+**Not one variable describes a defender.**
+
+::: {.notes}
+Pause here. This is the gap the project exists to fill. Source: Baldwin, Open
+Source Football, 2021.
+:::
+
+## What tracking can add
+
+At the moment of release:
+
+| Feature | What it measures |
+|---|---|
+| Separation, closing speed | How open the receiver is, and whether that's changing |
+| Leverage | Inside/outside, underneath/over the top |
+| Passing window | Nearest defender to the ball's corridor |
+| Time to arrival | Defender arrival time vs ball flight time |
+| QB state | Speed, throwing across the body |
+
+`cp` knows the pass went 14 yards down the middle. It cannot know whether the
+receiver was open.
+
+::: {.notes}
+Last line is the one to say out loud.
+:::
+
+## The problem I hit
+
+Every feature needs two points: the ball at the throw, and the ball at arrival.
+The dataset ships an "arrival" label.
+
+| | plays | completion rate |
+|---|---|---|
+| All thrown passes | 17,077 | **65.3%** |
+| Requiring the arrival label | 14,119 | **78.3%** |
+
+Missing on **50.6% of incompletions**, **0.8% of completions**.
+
+Using it would have deleted half my failures and moved the base rate of the
+response variable by 13 points.
+
+::: {.notes}
+Slowest slide in the deck. The filter looks like routine attrition and isn't.
+Flat across all 17 weeks, so it's a labeling convention, not a collection
+artifact.
+:::
+
+## Why, and the fix {.tighter}
+
+Ball displacement per frame, relative to the catch:
+
+| frames before | −8 | −5 | −3 | −2 | −1 | 0 |
+|---|---|---|---|---|---|---|
+| Completions | 2.13 | 2.05 | 1.77 | 1.23 | 0.70 | 0.62 |
+| Incompletions | 2.05 | 2.10 | 2.08 | 2.01 | 1.88 | 1.83 |
+
+A ball in flight moves $\approx 2.1$ yd/frame. A ball in someone's hands moves
+at running speed.
+
+**Arrival = the last frame the ball is still flying.** Measured, not labeled,
+and the rule never refers to the outcome.
+
+*Check:* implied ball speed now agrees between completions and incompletions
+within $1$ yd/s in all 11 depth bins checked, flat at $\approx 21$ yd/s.
+
+::: {.notes}
+"This table is a football being caught." Two rejected alternatives are in the
+notebook if anyone asks.
+:::
+
+## Next week
+
+**Build**
+
+- arrival + throw-frame slice, full season, re-validated
+- features at (play, receiver) grain
+- model population
+
+**Model** — nested comparison, out-of-sample log loss and calibration:
+
+$$\text{play-by-play} \;\to\; +\,\text{separation} \;\to\; +\,\text{full geometry}$$
+
+with nflverse `cp` as an external benchmark.
+
+::: {.notes}
+That nested comparison is the Week 6 "preliminary results." Results freeze is
+October 13.
+:::

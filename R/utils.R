@@ -12,6 +12,14 @@ KEY_COLS <- c(
   "week"
 )
 
+require_cols <- function(df, cols, what) {
+  missing <- setdiff(cols, names(df))
+  if (length(missing)) {
+    stop(what, " missing expected columns: ", paste0(missing, collapse = ", "))
+  }
+  invisible(df)
+}
+
 # camelCase -> snake_case
 to_snake <- function(x) {
   tolower(gsub("([a-z0-9])([A-Z])", "\\1_\\2", x))

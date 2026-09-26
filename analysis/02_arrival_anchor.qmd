@@ -1,0 +1,1096 @@
+---
+title: "Defining the arrival point"
+subtitle: "STAT 1961 Capstone — measurement decision for the completion model"
+author: "David Neumann"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: [brite, ../theme/capstone.scss]
+    code-summary: "Show code"
+    fig-width: 8
+    fig-height: 5
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 0. Setup
+
+```{r}
+#| label: setup
+#| include: false
+if (Sys.getenv("RENV_PROJECT") == "") {
+  root <- normalizePath("..", mustWork = TRUE)
+  Sys.setenv(RENV_PROJECT = root)
+  setwd(root)
+  source("renv/activate.R")
+}
+
+library(tidyverse)
+library(arrow)
+library(here)
+library(gt)
+library(gtExtras)
+library(scales)
+
+source(here("R", "constants.R"))
+source(here("R", "utils.R"))
+source(here("R", "arrival.R"))
+```
+
+## 0.1 What this notebook is
+
+Every coverage feature in the completion model is anchored to two points:
+the ball at the throw, and the ball at arrival. The throw is unambiguous —
+`analytic_sample.parquet` carries `f_throw` with the `pass_forward` /
+`pass_shovel` precedence already resolved. Arrival is not.
+
+This notebook establishes why the arrival point has to be *derived from the
+tracking data* rather than read off an event label, rejects two label-based
+alternatives with counts, and validates the definition that replaces them.
+The definition itself lives in `R/arrival.R`; `scripts/06_build_throw_frame.R`
+applies it at full-season scale.
+
+Like `analysis/01_eda.qmd`, this notebook reads and reports. It writes nothing
+to `data/`.
+
+Everything below except §1 and §2 runs on **week 1 only**. That is a
+prototyping decision: 890 plays is enough to characterize a measurement and
+fast enough to iterate on. §8 lists the full-season checks to re-run once `06`
+exists.
+
+```{r}
+#| label: load_data
+
+proto_week <- 1L
+
+trk <- open_dataset(here("data", "processed", "tracking"))
+
+plays <- read_parquet(here("data", "processed", "plays.parquet"))
+play_index <- read_parquet(here("data", "processed", "play_index.parquet"))
+analytic_sample <- read_parquet(here(
+  "data",
+  "processed",
+  "analytic_sample.parquet"
+))
+```
+
+Ball rows are roughly one-fourteenth of the tracking data, so the whole season
+of them collects comfortably into memory. `dis` is carried because it turns out
+to be the discriminating column in §7 — the kinematic defect scan in `03`
+filters `!is_ball`, so a ball moving at 2 yd/frame was never flagged and the
+column has gone unused until now.
+
+```{r}
+#| label: ball_rows
+
+ball <- trk |>
+  filter(is_ball) |>
+  select(game_id, play_id, frame_id, x, y, s, dis) |>
+  collect() |>
+  cast_keys()
+
+tibble(
+  quantity = c(
+    "ball rows",
+    "missing s",
+    "missing dis",
+    "median dis (yd/frame)"
+  ),
+  value = c(
+    comma(nrow(ball)),
+    as.character(sum(is.na(ball$s))),
+    as.character(sum(is.na(ball$dis))),
+    sprintf("%.2f", median(ball$dis, na.rm = TRUE))
+  )
+) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+One missing row in 1.25 million. Ball kinematics are effectively complete,
+which is what makes §7 possible.
+
+# 1. The problem
+
+## 1.1 `pass_arrived` is missing, and the missingness tracks the outcome
+
+```{r}
+#| label: arrival-availability
+
+analytic_sample |>
+  mutate(has_arrival = !is.na(f_pass_arrived)) |>
+  count(pass_result, has_arrival) |>
+  group_by(pass_result) |>
+  mutate(pct = n / sum(n)) |>
+  ungroup() |>
+  arrange(pass_result, desc(has_arrival)) |>
+  gt() |>
+  fmt_percent(columns = pct, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Roughly half of all incompletions carry no `pass_arrived` event, against
+under one percent of completions. The consequence is not a smaller sample, it
+is a different response variable.
+
+```{r}
+#| label: base-rate-shift
+
+throws <- analytic_sample |> filter(pass_result %in% c("C", "I", "IN"))
+
+tibble(
+  population = c("all thrown passes", "requires pass_arrived"),
+  plays = c(nrow(throws), sum(!is.na(throws$f_pass_arrived))),
+  completions = c(
+    sum(throws$pass_result == "C"),
+    sum(throws$pass_result == "C" & !is.na(throws$f_pass_arrived))
+  )
+) |>
+  mutate(completion_rate = completions / plays) |>
+  gt() |>
+  fmt_percent(columns = completion_rate, decimals = 1) |>
+  fmt_number(columns = c(plays, completions), decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-important appearance="simple"}
+
+Requiring an arrival event moves the completion rate of the modeling
+population by roughly 13 percentage points, by deleting about half of all
+incompletions. This is selection on the response variable, and unlike the
+missing-LOS block in `01_eda.qmd` §2.6 it cannot be handled by stating its
+direction in Methods. It has to be avoided.
+
+:::
+
+## 1.2 It is not a collection artifact
+
+Kinematic defects cluster by week (`01_eda.qmd` §2.2), which is what justified
+treating them as a data-quality exclusion. Arrival missingness does not
+cluster, so it is a labeling convention rather than a week-specific collection
+failure — which means no subset of weeks escapes it.
+
+```{r}
+#| label: arrival-by-week
+
+analytic_sample |>
+  group_by(week) |>
+  summarize(
+    plays = n(),
+    pct_missing_arrival = mean(is.na(f_pass_arrived))
+  ) |>
+  arrange(desc(pct_missing_arrival)) |>
+  gt() |>
+  fmt_percent(columns = pct_missing_arrival, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+# 2. Rejected: the `pass_outcome_*` family as a substitute
+
+The obvious repair is to fall back on a label that *is* present on
+incompletions. `pass_outcome_caught`, `pass_outcome_incomplete`,
+`pass_outcome_interception`, and `pass_outcome_touchdown` are mutually
+exhaustive in principle, so take whichever fires first.
+
+`pmin(..., na.rm = TRUE)` returns the earliest label present and `NA` only when
+all four are absent. Earliest matters on tipped passes, where more than one can
+fire.
+
+```{r}
+#| label: outcome-anchor
+
+arr <- analytic_sample |>
+  select(game_id, play_id, week, pass_result, f_throw, f_pass_arrived) |>
+  left_join(
+    play_index |>
+      select(
+        game_id,
+        play_id,
+        f_pass_outcome_caught,
+        f_pass_outcome_incomplete,
+        f_pass_outcome_interception,
+        f_pass_outcome_touchdown,
+        f_out_of_bounds
+      ),
+    by = c("game_id", "play_id")
+  ) |>
+  mutate(
+    f_outcome = pmin(
+      f_pass_outcome_caught,
+      f_pass_outcome_incomplete,
+      f_pass_outcome_interception,
+      f_pass_outcome_touchdown,
+      na.rm = TRUE
+    )
+  )
+
+arr |>
+  count(
+    pass_result,
+    has_arrival = !is.na(f_pass_arrived),
+    has_outcome = !is.na(f_outcome)
+  ) |>
+  arrange(pass_result, desc(n)) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Coverage is not the problem: an outcome label exists on 99.7% of plays,
+including nearly every incompletion that `pass_arrived` misses. The problem is
+*where* it fires.
+
+```{r}
+#| label: outcome-anchor-displacement
+
+arr |>
+  filter(!is.na(f_pass_arrived), !is.na(f_outcome)) |>
+  left_join(
+    ball |>
+      select(game_id, play_id, frame_id, x, y) |>
+      rename(x_a = x, y_a = y),
+    by = c("game_id", "play_id", "f_pass_arrived" = "frame_id")
+  ) |>
+  left_join(
+    ball |>
+      select(game_id, play_id, frame_id, x, y) |>
+      rename(x_o = x, y_o = y),
+    by = c("game_id", "play_id", "f_outcome" = "frame_id")
+  ) |>
+  mutate(
+    gap_frames = f_outcome - f_pass_arrived,
+    d_ball = sqrt((x_o - x_a)^2 + (y_o - y_a)^2),
+    dx_ball = x_o - x_a
+  ) |>
+  group_by(pass_result) |>
+  summarize(
+    plays = n(),
+    p50_gap_frames = median(gap_frames),
+    p50_d_ball = median(d_ball, na.rm = TRUE),
+    p90_d_ball = quantile(d_ball, 0.90, na.rm = TRUE),
+    p50_dx_ball = median(dx_ball, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  fmt_number(columns = starts_with("p50_d"), decimals = 2) |>
+  fmt_number(columns = p90_d_ball, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-warning appearance="simple"}
+
+**Rejected.** On plays carrying both labels, the ball sits a median of
+$\approx 1.9$ yd (completions) and $\approx 3.5$ yd (incompletions) away from
+where `pass_arrived` put it, with p90 around 4.4 and 8.1 yd. The displacement
+is systematically downfield (`p50_dx_ball` positive) and its magnitude depends
+on the outcome.
+
+The passing-window corridor is 2–3 yd wide. An anchor whose p90 error is 8 yd
+cannot define it. The physical story: `pass_outcome_incomplete` fires when the
+ball hits the turf, which is well past the receiver.
+
+:::
+
+# 3. The kinematic approach series
+
+With both label families rejected, arrival has to be *measured*. The raw
+material is the distance from the ball to the targeted receiver on every frame
+after the throw.
+
+Three choices are embedded in that sentence and each is a decision.
+
+**Whose position.** The targeted receiver, so this requires `target_tracked`.
+Plays without a tracked target are throwaways and spikes, and they are
+disproportionately incomplete — so `keep_target` is outcome-correlated. That is
+acceptable because it is a *population definition* (the question is about
+targeted passes), not a measurement failure, and it belongs in the `08` funnel
+framed that way. It is not acceptable to smuggle the same selection in through
+a measurement rule, which is what §1 would have done.
+
+**Search window.** Capped at `MAX_FLIGHT_FRAMES` = 50 frames, i.e. 5.0 s.
+Observed flight-time p99 is under 3.5 s (§7.2), so the cap only bounds
+pathological cases.
+
+**Which frame in the window.** This is the whole question, and §4 through §7
+work through three answers.
+
+```{r}
+#| label: build-approach
+
+targ <- analytic_sample |>
+  filter(target_tracked, week == proto_week) |>
+  select(
+    game_id,
+    play_id,
+    week,
+    pass_result,
+    f_throw,
+    f_pass_arrived,
+    target_nfl_id
+  )
+
+rec <- trk |>
+  filter(!is_ball, week == proto_week) |>
+  select(game_id, play_id, frame_id, nfl_id, x, y) |>
+  collect() |>
+  cast_keys() |>
+  inner_join(
+    targ |> select(game_id, play_id, target_nfl_id),
+    by = c("game_id", "play_id", "nfl_id" = "target_nfl_id")
+  ) |>
+  select(game_id, play_id, frame_id, x, y)
+
+appr <- build_approach(
+  ball = ball |> select(game_id, play_id, frame_id, x, y, dis),
+  receiver = rec,
+  throws = targ
+)
+
+tibble(
+  quantity = c(
+    "plays in week 1 sample",
+    "plays with a tracked target",
+    "plays with an approach series",
+    "frames in the search window"
+  ),
+  n = c(
+    sum(analytic_sample$week == proto_week),
+    nrow(targ),
+    n_distinct(appr$game_id, appr$play_id),
+    nrow(appr)
+  )
+) |>
+  gt() |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+# 4. Rejected: first local minimum
+
+The intuitive rule is "the frame where the gap stops shrinking":
+
+$$f_{\text{arr}} = \min\{f \in \mathcal{F} : d_{f+1} > d_f\}$$
+
+There is no $z$ coordinate in this dataset, so ground contact is invisible and
+a *global* minimum can land after a bounce. A local minimum is the end of the
+flight by construction. That was the reasoning; the data rejects it.
+
+```{r}
+#| label: v1-local-minimum
+
+arrival_v1 <- appr |>
+  group_by(game_id, play_id) |>
+  summarize(
+    n_searched = n(),
+    i_local = {
+      rise <- which(diff(d) > 0)[1]
+      if (is.na(rise)) length(d) else rise
+    },
+    f_arr = frame_id[i_local],
+    d_arr = d[i_local],
+    hit_edge = i_local == n_searched,
+    .groups = "drop"
+  ) |>
+  inner_join(
+    targ |> select(game_id, play_id, pass_result, f_throw),
+    by = c("game_id", "play_id")
+  ) |>
+  mutate(t_flight = (f_arr - f_throw) / TRACKING_HZ)
+
+arrival_v1 |>
+  group_by(pass_result) |>
+  summarize(
+    plays = n(),
+    p50_d_arr = median(d_arr),
+    p90_d_arr = quantile(d_arr, 0.90),
+    max_d_arr = max(d_arr),
+    edge = sum(hit_edge),
+    under_0.2s = sum(t_flight < 0.2),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  fmt_number(columns = starts_with(c("p50", "p90", "max")), decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-warning appearance="simple"}
+
+**Rejected.** Three failure modes, each visible in a different column.
+
+1. **Early trip.** Flight times of a single frame. `diff(d) > 0` fires on one
+   frame of measurement jitter just after release, and the search stops.
+2. **Plateau ambiguity.** After a catch the ball travels *with* the receiver,
+   so $d$ sits near zero for many frames and which one shows the first tiny
+   uptick is decided by noise.
+3. **Never closes.** On badly thrown passes $d$ is still decreasing at the
+   window edge, so the rule returns the boundary as a default.
+
+Face validity fails on the class where it should be trivial: on a completion
+the ball ends up in the receiver's hands, so `max_d_arr` for `C` ought to be
+small, and it is not.
+
+:::
+
+# 5. Rejected: closest approach within a tolerance
+
+Anchoring on the *global* minimum fixes failure modes 1 and 3, because a single
+noisy frame can no longer end the search. The plateau then needs resolving
+toward the catch rather than the carry, which suggests taking the earliest
+frame that is essentially as close as the minimum:
+
+$$f_{\text{arr}} = \min\{f \in \mathcal{F} : d_f \le \min_{g} d_g + \epsilon\},
+\qquad \epsilon = 0.25 \text{ yd}$$
+
+```{r}
+#| label: v2-tolerance
+
+EPS_V2 <- 0.25
+
+arrival_v2 <- appr |>
+  group_by(game_id, play_id) |>
+  summarize(
+    n_searched = n(),
+    i_arr = which(d <= min(d) + EPS_V2)[1],
+    i_min = which.min(d),
+    f_arr = frame_id[i_arr],
+    d_arr = d[i_arr],
+    x_arr = x_ball[i_arr],
+    y_arr = y_ball[i_arr],
+    d_min = d[i_min],
+    frames_earlier = i_min - i_arr,
+    .groups = "drop"
+  )
+
+arrival_v2 |>
+  inner_join(
+    targ |> select(game_id, play_id, pass_result),
+    by = c("game_id", "play_id")
+  ) |>
+  group_by(pass_result) |>
+  summarize(
+    plays = n(),
+    p50_d_arr = median(d_arr),
+    p90_d_arr = quantile(d_arr, 0.90),
+    max_d_arr = max(d_arr),
+    p50_earlier = median(frames_earlier),
+    p90_earlier = quantile(frames_earlier, 0.90),
+    corrected = sum(frames_earlier > 0),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  fmt_number(columns = starts_with(c("p50_d", "p90_d", "max")), decimals = 2) |>
+  fmt_number(columns = starts_with(c("p50_e", "p90_e")), decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Face validity is now excellent: every week-1 completion has the ball within
+about 1.1 yd of the targeted receiver at the selected frame, against 28 yd
+under §4. And the tolerance is doing real work — it moves the frame on the
+large majority of completions, by a median of several frames, while doing
+almost nothing on incompletions where there is no carry phase.
+
+That asymmetry is the tell, and it is what §6 investigates.
+
+## 5.1 The tolerance fails its own sensitivity check
+
+$\epsilon = 0.25$ yd was introduced as a numerical tolerance — a tie-break
+across a flat plateau, on the order of the coordinate rounding scale. If that
+were true, the selected frame would be insensitive to it.
+
+```{r}
+#| label: eps-sensitivity
+
+eps_grid <- c(0.10, 0.25, 0.50, 1.00)
+
+eps_sens <- map(eps_grid, \(e) {
+  appr |>
+    group_by(game_id, play_id) |>
+    summarize(
+      i = which(d <= min(d) + e)[1],
+      f = frame_id[i],
+      dd = d[i],
+      .groups = "drop"
+    ) |>
+    mutate(eps = e)
+}) |>
+  list_rbind()
+
+eps_sens |>
+  select(game_id, play_id, eps, f) |>
+  pivot_wider(names_from = eps, values_from = f, names_prefix = "f_") |>
+  summarize(
+    `frame agreement, 0.10 vs 0.25` = mean(f_0.1 == f_0.25),
+    `frame agreement, 0.50 vs 0.25` = mean(f_0.5 == f_0.25),
+    `median shift, 0.10` = median(f_0.1 - f_0.25),
+    `median shift, 0.50` = median(f_0.5 - f_0.25)
+  ) |>
+  pivot_longer(everything(), names_to = "statistic") |>
+  gt() |>
+  fmt_number(columns = value, decimals = 3) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-warning appearance="simple"}
+
+**Rejected, on two counts.**
+
+Halving $\epsilon$ from 0.25 to 0.10 changes the selected frame on the
+majority of plays. So there is no plateau to break ties on: $d$ shrinks
+gradually through the catch, and $\epsilon$ is not absorbing rounding, it is
+*choosing how close counts as arrived*. That is a substantive modeling
+parameter wearing a numerical-tolerance costume.
+
+Separately, the criterion is relative. Since $\min d \approx 0$ on completions
+and $\approx 1$ yd on incompletions, $d \le \min d + \epsilon$ applies a
+different absolute standard to each outcome class — the exact property this
+whole exercise exists to eliminate.
+
+:::
+
+# 6. Why the tolerance was needed: flight versus carry
+
+§5 showed the correction is large on completions and absent on incompletions.
+The ball's own per-frame displacement says why. Indexing every frame relative
+to the §5 anchor, and reading it as a profile rather than a summary:
+
+```{r}
+#| label: flight-carry-profile
+
+appr |>
+  inner_join(
+    arrival_v2 |> select(game_id, play_id, f_arr),
+    by = c("game_id", "play_id")
+  ) |>
+  inner_join(
+    targ |> select(game_id, play_id, pass_result),
+    by = c("game_id", "play_id")
+  ) |>
+  mutate(rel = frame_id - f_arr) |>
+  filter(pass_result %in% c("C", "I"), between(rel, -8, 3)) |>
+  group_by(pass_result, rel) |>
+  summarize(p50_dis = median(dis, na.rm = TRUE), n = n(), .groups = "drop") |>
+  pivot_wider(names_from = pass_result, values_from = c(p50_dis, n)) |>
+  gt() |>
+  fmt_number(columns = starts_with("p50"), decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Both classes fly at $\approx 2.1$ yd/frame, i.e. $\approx 21$ yd/s. Then
+completions decay to $\approx 0.6$ by the anchor frame while incompletions hold
+flight speed straight through it.
+
+This is a football being caught. On a completion the §5 anchor sits several
+frames *after* the ball stopped flying, and those frames are the receiver
+gathering the ball in. On an incompletion there is nothing to gather.
+
+## 6.1 The two regimes separate cleanly
+
+```{r}
+#| label: ball-dis-bimodality
+
+dis_window <- appr |> filter(!is.na(dis))
+
+quantile(dis_window$dis, c(0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)) |>
+  enframe(name = "quantile", value = "dis") |>
+  gt() |>
+  fmt_number(columns = dis, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: ball-dis-histogram
+#| fig-height: 4
+
+ggplot(dis_window, aes(dis)) +
+  geom_histogram(binwidth = 0.05, fill = "lightsteelblue3") +
+  geom_vline(xintercept = DIS_FLIGHT, colour = "firebrick", linewidth = 0.7) +
+  coord_cartesian(xlim = c(0, 4)) +
+  labs(
+    title = "Ball displacement per frame, throw to +5 s",
+    subtitle = paste0(
+      "Bimodal: carry and dead ball below ~1.0, flight at ~2.1. ",
+      "Red line is DIS_FLIGHT = ",
+      sprintf("%.2f", DIS_FLIGHT)
+    ),
+    x = "yd / frame",
+    y = "frames"
+  ) +
+  theme_minimal()
+```
+
+Two well-separated modes with a thin valley between them, floor around
+1.0–1.2 yd/frame. This figure is the justification for the threshold in §7 and
+belongs in the written report.
+
+# 7. Adopted: the last in-flight frame
+
+$$f_{\text{arr}} = \max\{f \le f_{\min} : \texttt{dis}_f \ge \delta\},
+\qquad f_{\min} = \arg\min_{f \in \mathcal{F}} d_f,
+\qquad \delta = \texttt{DIS\_FLIGHT}$$
+
+The last frame on which the ball is still unambiguously in flight.
+
+$\delta$ is defensible where $\epsilon$ was not, because it separates two
+physically distinct regimes rather than picking a point on a continuum.
+`DIS_FLIGHT` equals `MAX_DIS` **by argument, not by coincidence**: `MAX_DIS` is
+the per-frame displacement no *player* can exceed, so a ball above it cannot be
+in anyone's hands. §6.1 confirms the threshold lands in the valley.
+
+One frame now serves as both the lane endpoint and the flight-time endpoint,
+and no term in the definition refers to the outcome.
+
+```{r}
+#| label: v3-detect
+
+arrival_v3 <- detect_arrival(appr) |>
+  inner_join(
+    targ |> select(game_id, play_id, pass_result, f_throw, f_pass_arrived),
+    by = c("game_id", "play_id")
+  ) |>
+  mutate(t_flight = (f_arr - f_throw) / TRACKING_HZ)
+```
+
+## 7.1 Class similarity, not proximity to zero
+
+Under §5 the target was $d_{\text{arr}} \to 0$. That is the wrong target: a
+caught ball genuinely gets closer to the receiver than a dropped one, so an
+anchor that forces both to zero is measuring the outcome. The right target is
+$d_{\text{arr}}$ being *similar across classes*, with closest approach retained
+separately as the face-validity check.
+
+```{r}
+#| label: v3-class-similarity
+
+arrival_v3 |>
+  group_by(pass_result) |>
+  summarize(
+    plays = n(),
+    p50_d_arr = median(d_arr),
+    p90_d_arr = quantile(d_arr, 0.90),
+    p50_d_min = median(d_min),
+    p50_to_min = median(frames_to_min),
+    p90_to_min = quantile(frames_to_min, 0.90),
+    fallbacks = sum(used_fallback),
+    edge = sum(at_window_edge),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  fmt_number(columns = starts_with("p50_d"), decimals = 2) |>
+  fmt_number(columns = p90_d_arr, decimals = 2) |>
+  fmt_number(columns = ends_with("to_min"), decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+`p50_d_min` on completions confirms that closest approach is the catch, so the
+underlying series is right and only the frame selection changed.
+`frames_to_min` is the catch-plus-carry duration, not a gather time — $f_{\min}$
+is the deepest point of the carry, since $d$ stays near zero while the receiver
+holds the ball.
+
+## 7.2 Flight time
+
+```{r}
+#| label: v3-flight-time
+
+arrival_v3 |>
+  summarize(
+    p01 = quantile(t_flight, 0.01),
+    p50 = quantile(t_flight, 0.50),
+    p99 = quantile(t_flight, 0.99),
+    max = max(t_flight),
+    `under 0.4 s` = sum(t_flight < 0.4)
+  ) |>
+  pivot_longer(everything(), names_to = "statistic") |>
+  gt() |>
+  fmt_number(columns = value, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+p99 under 3.5 s is what justifies the 50-frame window cap. The handful of
+sub-0.4 s flights are not rule failures — a shovel pass or a ball batted at the
+line genuinely has a one-frame flight, and the beyond-the-LOS population filter
+in `08` removes them.
+
+```{r}
+#| label: v3-short-flights
+
+arrival_v3 |>
+  filter(t_flight < 0.4) |>
+  left_join(
+    analytic_sample |> select(game_id, play_id, throw_anchor),
+    by = c("game_id", "play_id")
+  ) |>
+  count(pass_result, throw_anchor, t_flight) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+## 7.3 The decisive check: implied ball speed by depth
+
+A measurement artifact in the arrival *timing* would show up as an
+outcome-dependent implied ball speed. Flight time legitimately differs by
+outcome — deep passes are both longer in the air and completed less often — so
+the test has to condition on lane length. 2-yard bins, which is tight enough
+that median lane length matches across classes within a bin.
+
+```{r}
+#| label: v3-speed-equalization
+
+lanes_v3 <- arrival_v3 |>
+  left_join(
+    ball |>
+      select(game_id, play_id, frame_id, x, y) |>
+      rename(x0 = x, y0 = y),
+    by = c("game_id", "play_id", "f_throw" = "frame_id")
+  ) |>
+  mutate(
+    lane_len = sqrt((x_arr - x0)^2 + (y_arr - y0)^2),
+    v_ball = lane_len / t_flight
+  )
+
+lanes_v3 |>
+  filter(pass_result %in% c("C", "I"), between(lane_len, 8, 30)) |>
+  mutate(bin = cut(lane_len, seq(8, 30, by = 2))) |>
+  group_by(bin, pass_result) |>
+  summarize(
+    n = n(),
+    p50_lane = median(lane_len),
+    p50_v = median(v_ball),
+    .groups = "drop"
+  ) |>
+  pivot_wider(
+    names_from = pass_result,
+    values_from = c(n, p50_lane, p50_v)
+  ) |>
+  gt() |>
+  fmt_number(columns = starts_with("p50"), decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-important appearance="simple"}
+
+**This is the result the definition rests on.** Implied ball speed agrees
+between completions and incompletions to within about 1 yd/s in every depth
+bin, and sits flat at $\approx 21$ yd/s across depth — a physically sensible
+constant for a thrown football.
+
+Under the §5 anchor the same table split 12.0 against 17.0 yd/s at short depth,
+converging only past 26 yd, which is the signature of a fixed number of
+contaminated frames rather than a football fact.
+
+Flat-across-depth is the stronger half of the result: the definition does not
+merely equalize two classes, it recovers a quantity that behaves the way ball
+flight should.
+
+:::
+
+## 7.4 Sensitivity: the flight threshold and the gap tolerance
+
+$\delta$ first. Two questions: does the selected frame move when the threshold
+moves, and does the speed equalization in §7.3 survive.
+
+```{r}
+#| label: delta-sensitivity
+
+delta_grid <- c(1.0, 1.3, 1.6, 1.9)
+
+delta_sens <- map(delta_grid, \(dd) {
+  detect_arrival(appr, dis_flight = dd) |>
+    select(game_id, play_id, f_arr, d_arr) |>
+    mutate(delta = dd)
+}) |>
+  list_rbind()
+
+delta_sens |>
+  group_by(delta) |>
+  summarize(p50_d_arr = median(d_arr), p90_d_arr = quantile(d_arr, 0.90)) |>
+  gt() |>
+  fmt_number(columns = starts_with("p"), decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: delta-agreement
+
+delta_sens |>
+  select(game_id, play_id, delta, f_arr) |>
+  pivot_wider(names_from = delta, values_from = f_arr, names_prefix = "f_") |>
+  summarize(
+    `agreement, 1.0 vs 1.3` = mean(f_1 == f_1.3),
+    `agreement, 1.6 vs 1.3` = mean(f_1.6 == f_1.3),
+    `median shift, 1.0` = median(f_1 - f_1.3),
+    `median shift, 1.6` = median(f_1.6 - f_1.3)
+  ) |>
+  pivot_longer(everything(), names_to = "statistic") |>
+  gt() |>
+  fmt_number(columns = value, decimals = 3) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Agreement well above 0.8 across a nearly two-fold range of $\delta$, with
+median shift zero — against 0.38 for the $\epsilon$ check in §5.1. That is the
+difference between separating two regimes and picking a point on a continuum.
+
+Now the gap tolerance. `flight_end_index()` merges flight-speed runs separated
+by fewer than `ARRIVAL_GAP_TOL` frames. The two extremes are both wrong:
+tolerance 0 lets one frame of jitter on a wobbling ball end the flight early,
+while an unbounded tolerance lets a jittery frame during a catch-and-run be
+selected as the flight end.
+
+```{r}
+#| label: gap-tolerance-extremes
+
+# Quantifying the disagreement the tolerance exists to split. The
+# unbounded rule is recovered at a tolerance wider than any window.
+gap_extremes <- inner_join(
+  detect_arrival(appr, gap_tol = 0L) |>
+    select(game_id, play_id, f_run = f_arr),
+  detect_arrival(appr, gap_tol = MAX_FLIGHT_FRAMES) |>
+    select(game_id, play_id, f_last = f_arr),
+  by = c("game_id", "play_id")
+)
+
+gap_extremes |>
+  summarize(
+    plays = n(),
+    differ = sum(f_run != f_last),
+    pct_differ = mean(f_run != f_last),
+    p50_gap = median((f_last - f_run)[f_run != f_last]),
+    max_gap = max(f_last - f_run)
+  ) |>
+  gt() |>
+  fmt_percent(columns = pct_differ, decimals = 1) |>
+  fmt_number(columns = c(plays, differ, p50_gap, max_gap), decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: gap-tolerance-sensitivity
+
+gap_grid <- c(0L, 1L, 2L, 3L, 5L)
+
+gap_sens <- map(gap_grid, \(g) {
+  detect_arrival(appr, gap_tol = g) |>
+    inner_join(
+      targ |> select(game_id, play_id, pass_result),
+      by = c("game_id", "play_id")
+    ) |>
+    group_by(pass_result) |>
+    summarize(
+      p50_d_arr = median(d_arr),
+      p90_d_arr = quantile(d_arr, 0.90),
+      .groups = "drop"
+    ) |>
+    mutate(gap_tol = g)
+}) |>
+  list_rbind()
+
+gap_sens |>
+  filter(pass_result %in% c("C", "I")) |>
+  pivot_wider(
+    names_from = pass_result,
+    values_from = c(p50_d_arr, p90_d_arr)
+  ) |>
+  relocate(gap_tol) |>
+  gt() |>
+  fmt_number(columns = -gap_tol, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-note appearance="simple"}
+
+`ARRIVAL_GAP_TOL` is set from this table. The value to pick is the one where
+$d_{\text{arr}}$ is stable in `gap_tol` and similar between classes; if the
+table is flat across the grid, the parameter does not matter and the choice
+costs nothing to defend. Record the chosen value and this table in
+`notes/decisions.md` §6.
+
+:::
+
+## 7.5 Bounce check
+
+Anchoring the search at $f_{\min}$ opens one door: a ball that skips off the
+turf and comes back *closer* to the receiver than it was in flight would put
+$f_{\min}$ on the bounce. There is no $z$ coordinate, so the test is the
+signature — $d$ rising substantially between the arrival frame and the minimum.
+
+```{r}
+#| label: bounce-check
+
+appr |>
+  inner_join(
+    arrival_v3 |> select(game_id, play_id, f_arr, f_min),
+    by = c("game_id", "play_id")
+  ) |>
+  filter(frame_id >= f_arr, frame_id <= f_min) |>
+  group_by(game_id, play_id) |>
+  summarize(max_rise = max(d) - first(d), .groups = "drop") |>
+  summarize(
+    plays = n(),
+    `rise > 1 yd` = sum(max_rise > 1),
+    `rise > 3 yd` = sum(max_rise > 3),
+    p99_rise = quantile(max_rise, 0.99)
+  ) |>
+  pivot_longer(everything(), names_to = "statistic") |>
+  gt() |>
+  fmt_number(columns = value, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+A handful of plays and a p99 under a yard. The ball moves monotonically toward
+its closest approach, so no flight/carry discriminator beyond $\delta$ is
+needed and the $f_{\min}$ bound is a belt-and-braces guard rather than a load
+-bearing one.
+
+## 7.6 Relationship to `pass_arrived`, where it exists
+
+Not a target to hit — §1 established the label is the inferior anchor — but the
+disagreement should be *explainable*, and the direction of the explanation
+matters.
+
+```{r}
+#| label: v3-vs-label
+
+val <- arrival_v3 |>
+  filter(!is.na(f_pass_arrived)) |>
+  left_join(
+    ball |>
+      select(game_id, play_id, frame_id, x, y) |>
+      rename(x_lab = x, y_lab = y),
+    by = c("game_id", "play_id", "f_pass_arrived" = "frame_id")
+  ) |>
+  mutate(
+    gap_frames = f_arr - f_pass_arrived,
+    d_ball = sqrt((x_arr - x_lab)^2 + (y_arr - y_lab)^2)
+  )
+
+val |>
+  group_by(pass_result) |>
+  summarize(
+    plays = n(),
+    p50_gap = median(gap_frames),
+    p50_d_ball = median(d_ball, na.rm = TRUE),
+    p90_d_ball = quantile(d_ball, 0.90, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  fmt_number(columns = starts_with("p50_d"), decimals = 2) |>
+  fmt_number(columns = p90_d_ball, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+The label fires at a *consistent* ball-to-receiver distance across outcome
+classes — about a yard out — so the labelers are doing something coherent:
+marking the ball arriving in the receiver's vicinity.
+
+```{r}
+#| label: label-distance
+
+appr |>
+  select(game_id, play_id, frame_id, d) |>
+  inner_join(
+    arrival_v3 |> select(game_id, play_id, pass_result, f_pass_arrived, d_arr),
+    by = c("game_id", "play_id", "frame_id" = "f_pass_arrived")
+  ) |>
+  group_by(pass_result) |>
+  summarize(
+    plays = n(),
+    p50_d_at_label = median(d),
+    p90_d_at_label = quantile(d, 0.90),
+    p50_d_at_arr = median(d_arr),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  fmt_number(columns = starts_with("p"), decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+What differs by outcome is what happens *after* that yard. On a completion the
+ball keeps coming until it is in the hands, which is a few frames later; on an
+incompletion nobody gathers it, so the label and the flight end coincide. Same
+uniform definition, different amount of remaining flight, because the outcome
+determines how close the ball ultimately gets.
+
+The check that this is lateness rather than a different event: on plays where
+the label fires first, is the ball still closing?
+
+```{r}
+#| label: label-monotonicity
+
+appr |>
+  inner_join(
+    val |>
+      filter(gap_frames > 0) |>
+      select(game_id, play_id, pass_result, f_pass_arrived, f_arr),
+    by = c("game_id", "play_id")
+  ) |>
+  filter(frame_id >= f_pass_arrived, frame_id <= f_arr) |>
+  group_by(game_id, play_id, pass_result) |>
+  summarize(
+    monotone = all(diff(d) <= 0),
+    net_change = last(d) - first(d),
+    .groups = "drop"
+  ) |>
+  group_by(pass_result) |>
+  summarize(
+    plays = n(),
+    pct_monotone = mean(monotone),
+    p50_net = median(net_change),
+    p90_net = quantile(net_change, 0.90),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  fmt_percent(columns = pct_monotone, decimals = 1) |>
+  fmt_number(columns = starts_with("p50_net"), decimals = 2) |>
+  fmt_number(columns = p90_net, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+The gap closes monotonically on the large majority of plays and `p50_net` is
+negative in every class: the ball was still approaching when the label fired
+and kept approaching until the adopted frame. The label is early, and this
+anchor is the later and physically correct one.
+
+Interceptions are a small class here and genuinely ambiguous — tipped balls,
+defenders carrying the ball away. Noted, not tuned to.
+
+# 8. What carries forward
+
+**Adopted.** `detect_arrival()` in `R/arrival.R`, with `DIS_FLIGHT`,
+`ARRIVAL_GAP_TOL`, and `MAX_FLIGHT_FRAMES` in `R/constants.R`. Applied at full
+-season scale by `scripts/06_build_throw_frame.R`.
+
+**Diagnostics travel with the output, and are not filtered on:** `d_arr`,
+`d_min`, `f_min`, `frames_to_min`, `used_fallback`, `at_window_edge`. Same
+pattern as `has_kinematic_defect` / `defect_in_window` in the sample layer, so
+a model can test sensitivity without rebuilding.
+
+::: {.callout-important appearance="simple"}
+
+**`d_arr` and `d_min` are never model features.** A ball ending up a tenth of a
+yard from the receiver *is* the catch. Either one would drive log loss down
+while saying nothing about whether coverage geometry carries information.
+
+Equally, badly thrown passes are **not filtered on `d_arr`**. A pass that never
+got near its target is a real play with real coverage geometry, and it is
+almost by definition an incompletion — excluding it would reintroduce exactly
+the selection on outcome that §1 rejected.
+
+:::
+
+**Full-season checks to re-run once `06` exists**, before any feature work:
+
+1. §7.1 class similarity, all 17 weeks. The week-1 numbers are the benchmark.
+2. §7.3 speed equalization, all 17 weeks. The result the definition rests on.
+3. §7.5 bounce check, since a rarer artifact may only appear at 17× the sample.
+4. Three plays rendered with `render_play()` — one completion, one incompletion,
+   one interception — stepped to `f_arr` to confirm visually that the ball is
+   where the number says it is. A sign error or an off-by-one is invisible in a
+   summary table and obvious in an animation.
+
+**Still open** (`notes/decisions.md` §7): whether `keep_arrival` survives as a
+flag now that arrival is derived rather than read, the beyond-the-LOS
+threshold, corridor width, and `qb_hit` as filter or covariate.

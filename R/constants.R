@@ -57,3 +57,31 @@ MAX_ACCEL <- 20 # yd/s^2
 
 PLAYER_S_MAX <- 9.22 # yd/s
 PLAYER_A_MAX <- 5.90 # yd/s^2
+
+# ---- arrival detection -----------------------------------------------
+# Arrival is the last frame the ball is still unambiguously in flight,
+# searched back from the frame of closest approach to the targeted
+# receiver. See notes/decisions.md §6 and analysis/02_arrival_anchor.qmd.
+#
+# DIS_FLIGHT equals MAX_DIS BY ARGUMENT, not by coincidence: MAX_DIS is
+# the per-frame displacement no *player* can exceed, so a ball above it
+# cannot be in anyone's hands. Verified against the bimodal distribution
+# of ball `dis` over the search window — carry and dead ball below ~1.0,
+# flight at ~2.1, valley floor around 1.0-1.2 yd/frame. Sensitivity: 87%
+# frame agreement at 1.0, 82% at 1.6, median shift 0 frames.
+#
+# If MAX_DIS is ever revised, revisit this alias rather than inheriting
+# the change silently.
+DIS_FLIGHT <- MAX_DIS
+
+# Flight-speed runs separated by fewer than this many frames are treated
+# as one run. A single frame of jitter on a wobbling ball dips below
+# DIS_FLIGHT mid-flight; ending the flight there is wrong. The two
+# extremes disagree on 92 of 890 week-1 plays (median gap 2 frames, max
+# 37), so neither 0 nor unbounded is right. Set from the sensitivity
+# table in analysis/02_arrival_anchor.qmd section 7.4.
+ARRIVAL_GAP_TOL <- 2L
+
+# Search window. Observed flight-time p99 is under 3.5 s; the cap only
+# bounds pathological cases.
+MAX_FLIGHT_FRAMES <- 50L
