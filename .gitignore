@@ -24,3 +24,4 @@ outputs/figures/*.mp4
 _freeze/
 
 **/*.quarto_ipynb
+CLAUDE.md

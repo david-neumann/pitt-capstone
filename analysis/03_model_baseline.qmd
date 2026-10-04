@@ -1,0 +1,612 @@
+---
+title: "Completion probability — baseline models"
+subtitle: "STAT 1961 Capstone — preliminary results"
+author: "David Neumann"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: [brite, ../theme/capstone.scss]
+    code-summary: "Show code"
+    fig-width: 8
+    fig-height: 5
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 0. Setup
+
+```{r}
+#| label: setup
+#| include: false
+if (Sys.getenv("RENV_PROJECT") == "") {
+  root <- normalizePath("..", mustWork = TRUE)
+  Sys.setenv(RENV_PROJECT = root)
+  setwd(root)
+  source("renv/activate.R")
+}
+
+library(tidyverse)
+library(arrow)
+library(here)
+library(gt)
+library(gtExtras)
+library(scales)
+
+# Attached after tidyverse deliberately: nlme (pulled in by mgcv) masks
+# dplyr::collapse(), which is unused here. mgcv must be ATTACHED rather
+# than merely installed, because the MODEL_SPECS formulas are written
+# with bare s() and the formula environment has to resolve it.
+library(mgcv)
+
+source(here("R", "constants.R"))
+source(here("R", "utils.R"))
+source(here("R", "evaluate.R"))
+
+fig_dir <- here("figs", "week06")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 0.1 What this notebook is, and is not
+
+This notebook reports. It reads persisted artifacts and writes nothing to
+`data/`, the same contract as `analysis/01_eda.qmd` and
+`analysis/02_arrival_anchor.qmd`. Figures are written to `figs/week06/` and
+referenced statically from the slide deck.
+
+Two things about it are **provisional**, and both belong on the slide rather
+than in a footnote.
+
+::: {.callout-important appearance="simple"}
+
+**The model frame is assembled here, in §1.1.** That assembly is
+`scripts/08_build_model_frame.R`'s job and that script does not exist yet.
+Nothing is written to disk, so the architectural rule holds, but these results
+are not yet reproducible from a build artifact.
+
+**The population filters for this question are not applied.** Beyond the line
+of scrimmage, a tracked targeted receiver, not a spike, not a scramble — none
+of them. These are results on the **full throw population**, every play in
+`analytic_sample.parquet` with `pass_result` in {C, I, IN}.
+
+The beyond-the-LOS filter alone will remove roughly a fifth of these plays
+(`notes/decisions.md` §7), which changes every number below. Stage 3 and 4
+features do not exist yet either, so what follows is the **floor and the
+baseline**, plus the external benchmark. The thesis is untested.
+
+:::
+
+```{r}
+#| label: load_data
+
+analytic_sample <- read_parquet(here(
+  "data",
+  "processed",
+  "analytic_sample.parquet"
+))
+plays <- read_parquet(here("data", "processed", "plays.parquet"))
+pbp <- read_parquet(here("data", "processed", "pbp.parquet"))
+```
+
+# 1. The model frame
+
+## 1.1 Assembly
+
+Three sources, joined on `(game_id, play_id)`. The join takes from each table
+only the columns the other two lack, because `analytic_sample.parquet` already
+carries `down`, `yards_to_go`, `los_x`, and `week` — pulling them again would
+produce suffixed `.x` / `.y` pairs rather than an error.
+
+- `analytic_sample.parquet` — the spine, and the response via `pass_result`
+- `plays.parquet` — `number_of_pass_rushers`, which `04_build_sample.R` did not
+  carry forward because the sample rule did not need it
+- `pbp.parquet` — `air_yards`, `pass_location`, `qb_hit`, `shotgun`,
+  `posteam_type`, and the benchmark columns `cp` / `has_cp`
+
+`plays.parquet` is not widened by re-running `04`: the analytical sample is a
+locked artifact of the sample layer, and adding model covariates to it would
+conflate the sample layer with the feature layer.
+
+```{r}
+#| label: assemble
+
+model_input <- analytic_sample |>
+  left_join(
+    plays |> select(game_id, play_id, number_of_pass_rushers),
+    by = c("game_id", "play_id")
+  ) |>
+  left_join(pbp, by = c("game_id", "play_id")) |>
+  filter(pass_result %in% c("C", "I", "IN"))
+
+tibble(
+  quantity = c(
+    "plays in analytic_sample",
+    "thrown passes (C, I, IN)",
+    "removed: sacks and scrambles",
+    "matched to play-by-play",
+    "carrying the cp benchmark"
+  ),
+  n = c(
+    nrow(analytic_sample),
+    nrow(model_input),
+    nrow(analytic_sample) - nrow(model_input),
+    sum(model_input$pbp_matched),
+    sum(model_input$has_cp)
+  )
+) |>
+  mutate(pct_of_throws = n / nrow(model_input)) |>
+  gt() |>
+  fmt_percent(columns = pct_of_throws, decimals = 1) |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Sacks are removed because they are not throws. `keep_any_throw` in the sample
+rule defines the population as plays where a forward pass was *released*
+(`notes/decisions.md` §4.6), and a sack carries a throw event on a small number
+of plays; this filter is on the outcome code rather than the event, so it
+catches those.
+
+## 1.2 Derived predictors
+
+`prepare_model_frame()` in `R/evaluate.R` owns the response and three derived
+columns, so that every stage and the benchmark see identical inputs. The
+reasoning for each is in that file's header; the observable effects:
+
+```{r}
+#| label: prepare
+
+mf <- prepare_model_frame(model_input)
+
+tibble(
+  transformation = c(
+    "response: complete = 1 for C, 0 for I and IN",
+    "number_of_pass_rushers clamped to [2, 7]",
+    "dist_to_sticks = air_yards - yards_to_go",
+    "air_yards_zero: plays at exactly 0 air yards",
+    "home = posteam_type == 'home'"
+  ),
+  affected = c(
+    sum(mf$complete),
+    sum(
+      model_input$number_of_pass_rushers != mf$number_of_pass_rushers,
+      na.rm = TRUE
+    ),
+    sum(!is.na(mf$dist_to_sticks)),
+    sum(mf$air_yards_zero, na.rm = TRUE),
+    sum(mf$home, na.rm = TRUE)
+  )
+) |>
+  gt() |>
+  fmt_number(columns = affected, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+An interception counts as an incompletion. This is how nflverse `cp` is defined,
+and matching it is what makes the benchmark comparison meaningful rather than a
+comparison of two different response variables.
+
+## 1.3 The scoring population
+
+Every stage's log loss has to be computed on the same rows, or the *differences*
+between stages are not differences. `glm()` and `mgcv::gam()` default to
+`na.action = na.omit`, so a stage referencing a column with missingness would
+quietly fit and score fewer plays than the stage below it — no warning, no
+error, and a delta computed across two different datasets.
+
+`assert_complete()` therefore **asserts rather than filters**. Dropping rows is
+an exclusion, exclusions are checked for differential completion rates and
+logged with counts (`notes/decisions.md` §4.7), and the modeling layer is not
+permitted to change the population silently.
+
+```{r}
+#| label: required-vars
+
+tibble(variable = model_vars()) |>
+  gt() |>
+  tab_header(title = "Columns required by MODEL_SPECS") |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: incomplete-columns
+
+rep <- incomplete_report(mf)
+
+rep$by_column |>
+  gt() |>
+  fmt_percent(columns = pct_missing, decimals = 4) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Three plays, and the seven rows above are not seven independent gaps: the four
+`air_yards`-derived columns fail together on the same 3 plays, and the single
+missing `shotgun` / `home` / `qb_hit` is one of those 3 — the one play that
+found no play-by-play partner (`notes/decisions.md` §8.2).
+
+```{r}
+#| label: incomplete-composition
+
+rep$composition |>
+  gt() |>
+  fmt_percent(columns = share, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-note appearance="simple"}
+
+**Checked and immaterial.** The dropped block is 1 completion and 2
+incompletions. Three plays cannot be selected on anything, and the base rate
+moves by two parts in a million. This is the routine version of the check that
+rejected the `pass_arrived` anchor in `02_arrival_anchor.qmd` §1; it is run on
+every exclusion regardless of expected size, because the expensive failures are
+the ones that look routine.
+
+:::
+
+```{r}
+#| label: scoring-population
+
+vars <- model_vars()
+mf_complete <- filter(mf, complete.cases(mf[vars]))
+
+assert_complete(mf_complete)
+
+tibble(
+  quantity = c(
+    "thrown passes",
+    "complete cases across all specs",
+    "dropped",
+    "completions",
+    "base rate"
+  ),
+  value = c(
+    comma(nrow(mf)),
+    comma(nrow(mf_complete)),
+    comma(nrow(mf) - nrow(mf_complete)),
+    comma(sum(mf_complete$complete)),
+    sprintf("%.4f", mean(mf_complete$complete))
+  )
+) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+The base rate of $0.6529$ is the number stage 1 exists to reproduce, and the
+number every later stage has to beat.
+
+# 2. Resampling
+
+## 2.1 Leave-one-week-out, not random $k$-fold
+
+Plays are not independent. Two plays from the same game share a quarterback, a
+defense, a game plan, the weather, and the officiating crew. Under a random
+split, one of them can sit in the training set while the other is scored, and
+the model predicts the second partly by having memorized conditions from the
+first. The resulting estimate is optimistic and **carries no signature** — there
+is nothing in the number that reveals the problem.
+
+Grouping the folds by week makes every fold a clean block: fit on 16 weeks,
+predict the 17th, rotate. It also mirrors how such a model would actually be
+used, which is a better justification than a technical one. The general argument
+is in Roberts et al. (2017), *Ecography*.
+
+No seed is needed. With one group per fold there is no random assignment of
+groups to folds, so the only thing that could vary is the returned order, and
+`make_folds()` sorts.
+
+```{r}
+#| label: folds
+
+folds <- make_folds(mf_complete)
+
+tibble(
+  held_out_week = folds$held_out,
+  train_n = map_int(folds$splits, \(s) nrow(rsample::analysis(s))),
+  test_n = map_int(folds$splits, \(s) nrow(rsample::assessment(s)))
+) |>
+  gt() |>
+  fmt_number(columns = c(train_n, test_n), decimals = 0) |>
+  grand_summary_rows(
+    columns = test_n,
+    fns = list(total = ~ sum(.)),
+    fmt = ~ fmt_number(., decimals = 0)
+  ) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+The `test_n` total equals the scoring population exactly, which is the property
+that makes the pooled out-of-fold predictions in §4 a complete prediction for
+every play: each one is predicted exactly once, by a fit that never saw its
+week.
+
+# 3. Stage 2, interpreted
+
+Two different jobs, kept separate. The 17 cross-validation fits answer *how well
+does this predict* and are discarded — their only product is the prediction
+table in §4. A single fit on all the data answers *what did it learn*, and that
+is the object below.
+
+::: {.callout-warning appearance="simple"}
+
+**Nothing in this section is out-of-sample.** No metric reported here is a
+performance estimate. Section 5 onward is where performance is measured.
+
+:::
+
+```{r}
+#| label: full-fit
+
+f2 <- fit_full(mf_complete, MODEL_SPECS[["2. play-by-play"]])
+
+summary(f2)
+```
+
+## 3.1 Reading the parametric terms
+
+```{r}
+#| label: parametric-terms
+
+summary(f2)$p.table |>
+  as.data.frame() |>
+  rownames_to_column("term") |>
+  as_tibble() |>
+  rename(estimate = Estimate, se = `Std. Error`, p = `Pr(>|z|)`) |>
+  select(term, estimate, se, p) |>
+  arrange(p) |>
+  gt() |>
+  fmt_number(columns = c(estimate, se), decimals = 3) |>
+  fmt_scientific(columns = p, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Three of these are worth reporting as findings rather than as controls.
+
+**`air_yards_zero` at $-0.87$ on the logit scale**, against an intercept of
+$1.00$: a throw at exactly zero air yards has roughly half the odds of
+completion of one nearby on either side. nflverse describes this indicator as a
+relic of its pre-tree models, and for a tree it is — a tree can split at exactly
+$0$. A penalized spline cannot; it smooths straight over a point mass of 1,093
+plays. Including it raised the effective degrees of freedom on `s(air_yards)`
+from $4.37$ to $7.67$ and improved deviance explained on a strictly smaller
+model.
+
+**`shotgun` at $-0.171$**, which is the opposite sign from the conventional
+wisdom that passing statistics are inflated out of shotgun. Both can be true:
+shotgun throws are systematically shorter, so the raw advantage is confounded by
+depth, and conditioning on depth inverts it. This coefficient was *not*
+estimable in the first fit, where `offense_formation` was also in the model — an
+EMPTY-backfield snap is essentially always from shotgun, so the two were aliased
+and the standard error on `shotgun` was $0.349$ rather than $0.047$.
+
+**`qb_hit` at $-0.88$** is the largest effect among the parametric terms. This
+vindicates treating it as a covariate rather than as an exclusion
+(`notes/decisions.md` §7): it is a play-level flag that does not distinguish
+"hit during the throw" from "hit afterwards," so filtering on it would remove
+real passes and may itself select on outcome, while including it is informative
+and cheap to defend.
+
+## 3.2 Reading the smooths
+
+`edf` is the effective degrees of freedom the penalty actually chose. An `edf`
+near $1$ means the penalty shrank the smooth to a straight line — the term is in
+the model but the relationship is linear.
+
+```{r}
+#| label: smooth-terms
+
+summary(f2)$s.table |>
+  as.data.frame() |>
+  rownames_to_column("smooth") |>
+  as_tibble() |>
+  rename(p = `p-value`) |>
+  gt() |>
+  fmt_number(columns = c(edf, Ref.df, `Chi.sq`), decimals = 2) |>
+  fmt_scientific(columns = p, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+`s(dist_to_sticks)` comes back essentially null: `edf` $1.01$, $p = 0.10$. The
+motivation was sound — additive smooths in `air_yards` and `yards_to_go` cannot
+represent their difference, which is an interaction, and a 3-yard throw on
+3rd-and-2 is a different play from a 3-yard throw on 3rd-and-15 — but the data
+does not support it. Conditional on depth, whether the throw reaches the line to
+gain barely affects whether it is caught. In hindsight this is sensible: the
+sticks govern *play calling*, which is upstream of the throw rather than a
+property of it.
+
+**It stays in the model anyway.** Stage 2 exists to be a strong baseline, and
+pruning a baseline on in-sample significance is what makes a nested comparison
+look tuned. It costs one effective degree of freedom out of 17,074 observations.
+It also spans the `yards_to_go` direction, so dropping it would remove that
+variable from the model entirely.
+
+```{r}
+#| label: gam-check
+
+gam.check(f2)
+```
+
+The basis dimension check is the part to read. `k-index` below $1$ with a small
+$p$-value suggests the basis is too small — *especially* when `edf` sits close to
+`k'`. Here the largest `edf` is $7.67$ against `k'` of $9$, and the penalty is
+choosing well short of the available flexibility everywhere else, so the default
+basis is adequate.
+
+Do not over-read the residual plots. Deviance residuals from a binomial fit on a
+binary response always separate into two arcs; that is a property of binary data
+rather than a diagnosis.
+
+```{r}
+#| label: smooth-plots
+#| fig-height: 6
+
+par(mfrow = c(2, 2))
+plot(f2, shade = TRUE, seWithMean = TRUE, scale = 0)
+par(mfrow = c(1, 1))
+```
+
+`seWithMean = TRUE` includes the uncertainty in the intercept, which is the
+interval you want when reading a smooth as a partial effect. `scale = 0` lets
+each panel set its own $y$ range, so a flat term looks flat rather than being
+stretched to fill the plot.
+
+## 3.3 Model fit, in context
+
+```{r}
+#| label: fit-summary
+
+sm <- summary(f2)
+
+tibble(
+  quantity = c(
+    "deviance explained",
+    "adjusted R-squared",
+    "-REML",
+    "n",
+    "total effective degrees of freedom"
+  ),
+  value = c(
+    percent(sm$dev.expl, accuracy = 0.01),
+    sprintf("%.3f", sm$r.sq),
+    sprintf("%.1f", f2$gcv.ubre),
+    comma(sm$n),
+    sprintf("%.1f", sum(f2$edf))
+  )
+) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+::: {.callout-note appearance="simple"}
+
+**Deviance explained of 9.85% is the expected magnitude, not a problem.**
+Completion is a genuinely noisy outcome and play-by-play information explains
+little of it. Two consequences worth stating up front.
+
+First, nflverse `cp` sees roughly this same information, so it should not be
+dramatically better than stage 2 — and if it is, that difference is informative
+about model class rather than about features.
+
+Second, the unexplained variance is the room stages 3 and 4 have to work in. A
+baseline that explained most of the outcome would leave nothing for coverage
+geometry to claim. This number is the reason the project is worth doing.
+
+:::
+
+# 4. Out-of-fold predictions
+
+Each stage is fit 17 times and every play is predicted once, by a fit that never
+saw its week. The result is one row per (play, model).
+
+Predictions are **pooled** rather than averaged across folds. With folds of
+unequal size, the mean of per-fold log losses and the log loss of the pooled
+predictions are different numbers, and only the pooled version can be subset
+afterwards — to the `has_cp` rows, or to separation buckets — without refitting
+anything.
+
+```{r}
+#| label: cv-predict
+
+preds <- cv_predict_all(mf_complete, folds, verbose = FALSE)
+
+preds |>
+  group_by(model) |>
+  summarize(
+    n = n(),
+    min = min(.pred),
+    p25 = quantile(.pred, 0.25),
+    median = median(.pred),
+    mean = mean(.pred),
+    p75 = quantile(.pred, 0.75),
+    max = max(.pred),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  fmt_number(columns = -c(model, n), decimals = 3) |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Two things in that table are checks rather than description.
+
+**The mean prediction should sit on the base rate.** It does, for both stages, to
+four decimal places against $0.6529$. A visible gap here would be the first sign
+of a calibration problem, and it shows up before any metric is computed.
+
+**Stage 1's spread is the fold-to-fold variation in the base rate itself**, not a
+model learning anything: each of its 17 distinct predictions is the completion
+rate of the *other* 16 weeks. The range $0.650$ to $0.655$ is therefore a useful
+incidental measurement — week-to-week completion rate in 2018 varied by about
+half a percentage point around its mean.
+
+```{r}
+#| label: prediction-distributions
+#| fig-height: 4
+
+p_dist <- preds |>
+  ggplot(aes(.pred, fill = model)) +
+  geom_histogram(binwidth = 0.02, alpha = 0.75, position = "identity") +
+  geom_vline(
+    xintercept = mean(mf_complete$complete),
+    linetype = "dashed",
+    linewidth = 0.5
+  ) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+  labs(
+    title = "Out-of-fold predicted completion probability, by stage",
+    subtitle = paste0(
+      "Dashed line is the sample base rate (",
+      percent(mean(mf_complete$complete), accuracy = 0.1),
+      "). Stage 1 predicts it by construction."
+    ),
+    x = "predicted P(complete)",
+    y = "plays",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave(
+  here("figs", "week06", "prediction_distributions.png"),
+  p_dist,
+  width = 8,
+  height = 4,
+  dpi = 200
+)
+
+p_dist
+```
+
+A model that discriminates has to *spread out*: pushing predictions away from the
+base rate is how it earns a lower log loss, and being wrong while spread out is
+how it earns a worse one. Stage 2 spans roughly $0.07$ to $0.92$. Whether that
+spread is justified is the question §5 and §6 answer.
+
+```{r}
+#| label: observed-vs-predicted-band
+
+# A coarse look ahead at calibration: within deciles of prediction, does
+# the observed rate track? Section 6 does this properly, with intervals.
+preds |>
+  filter(model == "2. play-by-play") |>
+  mutate(bin = ntile(.pred, 10)) |>
+  group_by(bin) |>
+  summarize(
+    n = n(),
+    mean_pred = mean(.pred),
+    obs_rate = mean(complete),
+    .groups = "drop"
+  ) |>
+  mutate(gap = obs_rate - mean_pred) |>
+  gt() |>
+  fmt_number(columns = c(mean_pred, obs_rate, gap), decimals = 3) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Sections 5 through 8 — scoring, calibration, the `cp` benchmark, and $\Delta$ log
+loss with a clustered interval — follow.
