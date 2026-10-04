@@ -20,6 +20,8 @@
 #   cv_predict()            out-of-fold predictions, one spec
 #   cv_predict_all()        out-of-fold predictions, every spec
 #   fit_full()              one fit on everything, for interpretation
+#   pointwise_log_loss()    per-play log loss, no clipping
+#   log_loss()              its mean: the pooled out-of-fold metric
 #
 # REQUIRES mgcv to be ATTACHED, not merely installed, before any fit.
 # The spec formulas are written with bare s(), and the formula's
@@ -538,4 +540,65 @@ cv_predict_all <- function(df, folds, specs = MODEL_SPECS, verbose = TRUE) {
 #' Nothing here is out-of-sample. Do not report a metric from this fit.
 fit_full <- function(df, spec) {
   fit_one(spec, df)
+}
+
+
+# ---- scoring -----------------------------------------------------
+
+#' Per-play log loss, in nats
+#'
+#' -[y log(p) + (1 - y) log(1 - p)] for each play. Returned per play
+#' rather than only as a mean because the paired delta between two
+#' stages is a difference of these vectors row by row, and its interval
+#' resamples them in clusters. A mean-only function would force a
+#' second implementation later.
+#'
+#' WRITTEN BY HAND rather than with yardstick::mn_log_loss(), for two
+#' reasons. yardstick wants a factor truth and a named probability
+#' column, and its `event_level` default treats the first level ("0")
+#' as the event, so a forgotten argument scores P(incomplete) against
+#' completions and returns a plausible number. And it clips
+#' probabilities by default, which hides exactly the failure the guard
+#' below exists to surface.
+#'
+#' NO CLIPPING. A prediction of exactly 0 or 1 is a bug upstream (a
+#' link-scale predict(), a degenerate fit, a benchmark column on the
+#' wrong scale), and clipping would turn it into a large but finite
+#' penalty that looks like a bad model rather than a broken harness.
+#' fit_fold() already asserts 0 < p < 1 for the stage fits; the guard
+#' here is what covers nflverse `cp`, which never passes through it.
+#'
+#' log1p(-p) rather than log(1 - p): the same value, but accurate when
+#' p is close to 0, where 1 - p rounds.
+#'
+#' @param y Observed outcome, 0 or 1.
+#' @param p Predicted probability that y = 1, strictly inside (0, 1).
+#' @return Numeric vector the length of `y`.
+pointwise_log_loss <- function(y, p) {
+  stopifnot(
+    length(y) == length(p),
+    length(y) > 0,
+    !anyNA(y),
+    !anyNA(p),
+    all(y %in% c(0, 1)),
+    all(p > 0 & p < 1)
+  )
+
+  -(y * log(p) + (1 - y) * log1p(-p))
+}
+
+
+#' Mean log loss, in nats
+#'
+#' The pooled metric: the mean over every play's out-of-fold
+#' prediction, not a mean of per-fold means (see cv_predict()).
+#'
+#' REFERENCE POINT: a constant prediction at the base rate ybar scores
+#' the binary entropy H(ybar), 0.6457 nats at ybar = 0.65286. Stage 1's
+#' out-of-fold score cannot fall below it, because each held-out week
+#' is predicted by the other weeks' mean, which sits on the far side of
+#' ybar from that week's own rate. A stage 1 value below H(ybar) means
+#' the folds are leaking.
+log_loss <- function(y, p) {
+  mean(pointwise_log_loss(y, p))
 }

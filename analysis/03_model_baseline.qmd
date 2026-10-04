@@ -608,5 +608,92 @@ preds |>
   gt_theme_538(quiet = TRUE)
 ```
 
-Sections 5 through 8 — scoring, calibration, the `cp` benchmark, and $\Delta$ log
-loss with a clustered interval — follow.
+# 5. Scoring
+
+## 5.1 Log loss
+
+The metric is the mean negative log-likelihood of the observed outcomes under the
+out-of-fold predictions, in nats:
+
+$$
+\text{LL} = -\frac{1}{n}\sum_{i=1}^{n}\Big[y_i \log \hat p_i + (1 - y_i)\log(1 - \hat p_i)\Big]
+$$
+
+It is a proper scoring rule: it is minimized in expectation only by reporting the
+true probability, so it rewards calibration and discrimination together rather
+than one at the expense of the other. `pointwise_log_loss()` and `log_loss()` in
+`R/evaluate.R` are written by hand rather than taken from yardstick, and they
+assert $0 < \hat p < 1$ rather than clipping. The reasons are in that file.
+
+**The reference point is the binary entropy of the base rate.** A constant
+prediction at $\bar y$ scores
+
+$$
+H(\bar y) = -\big[\bar y \log \bar y + (1 - \bar y)\log(1 - \bar y)\big],
+$$
+
+and stage 1 cannot beat it out of fold. Each held-out week $w$ is predicted by
+the completion rate of the other 16 weeks, which lies on the *opposite* side of
+$\bar y$ from that week's own rate $r_w$. Log loss within a week is convex in the
+prediction and minimized at $r_w$, so every week scores at least as badly as it
+would at $\bar y$. A stage 1 value below $H(\bar y)$ would mean information is
+leaking across folds.
+
+Both expectations are asserted below, so a render fails rather than reporting a
+broken harness.
+
+```{r}
+#| label: log-loss
+
+ybar <- mean(mf_complete$complete)
+h_ybar <- -(ybar * log(ybar) + (1 - ybar) * log1p(-ybar))
+
+scores <- preds |>
+  group_by(model) |>
+  summarize(
+    n = n(),
+    log_loss = log_loss(complete, .pred),
+    .groups = "drop"
+  ) |>
+  mutate(
+    vs_entropy = log_loss - h_ybar,
+    vs_intercept = log_loss - log_loss[model == "1. intercept"]
+  )
+
+stopifnot(
+  scores$log_loss[scores$model == "1. intercept"] >= h_ybar,
+  scores$log_loss[scores$model == "2. play-by-play"] <
+    scores$log_loss[scores$model == "1. intercept"]
+)
+
+scores |>
+  gt() |>
+  tab_header(
+    subtitle = sprintf(
+      "Out-of-fold, n = %s. H(base rate) = %.4f nats.",
+      comma(nrow(mf_complete)),
+      h_ybar
+    ),
+    title = "Log loss by stage"
+  ) |>
+  fmt_number(columns = c(log_loss, vs_entropy, vs_intercept), decimals = 4) |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+**Stage 1 sits $0.0001$ nats above the floor**, which is the size the argument
+above predicts: the 17 fold means span only $0.650$ to $0.655$ (§4), so the
+penalty for predicting each week with the other weeks' rate is tiny but cannot be
+negative.
+
+**Stage 2 improves on it by $0.062$ nats.** As a share of the stage 1 loss that
+is about $9.6\%$, against $9.85\%$ deviance explained in-sample (§3.3). The
+out-of-fold figure being only slightly smaller is the expected direction, and its
+small size says the stage 2 smooths are not overfitting at this sample size.
+
+This is the number stages 3 and 4 have to improve on. Whether a difference of a
+given size is distinguishable from fold-to-fold noise is a question for the
+paired interval, which follows.
+
+Sections 6 through 8 — $\Delta$ log loss with a clustered interval, calibration,
+and the `cp` benchmark — follow.
