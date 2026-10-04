@@ -440,7 +440,8 @@ pt |>
   gt_theme_538(quiet = TRUE)
 ```
 
-Three of these are worth reporting as findings rather than as controls.
+Two of these are worth reporting as findings rather than as controls. A third,
+`qb_hit`, is no longer a single coefficient; see §3.2.
 
 **`air_yards_zero` at `r b("air_yards_zero")` on the logit scale**, against an
 intercept of `r b("(Intercept)")`: a throw at exactly zero air yards has
@@ -461,12 +462,6 @@ confounded by depth, and conditioning on depth inverts it. This coefficient was
 *not* estimable in the first specification, which also included
 `offense_formation`: an empty-backfield snap is essentially always from shotgun,
 so the two were aliased and the standard error on `shotgun` was $0.349$.
-
-**`qb_hit` at `r b("qb_hit")`** is the largest effect among the parametric
-terms. This supports treating it as a covariate rather than as an exclusion
-(`notes/decisions.md` §7): it is a play-level flag that does not distinguish
-"hit during the throw" from "hit afterwards," so filtering on it would remove
-real passes and may itself select on outcome.
 
 `pass_location` is kept at three levels. Against left, middle is
 `r b("pass_locationmiddle")` and right `r b("pass_locationright")`
@@ -515,6 +510,48 @@ look tuned. It costs one effective degree of freedom out of
 It also spans the `yards_to_go` direction, so dropping it would remove that
 variable from the model entirely.
 
+**The QB-hit effect varies with depth.** `qb_hit` enters as
+`s(air_yards, by = qb_hit)`: a smooth in air yards that applies only to plays
+with a hit, so the hit's effect on the logit is a function of depth. A
+diagnosis of an earlier specification, which held the hit effect constant,
+found its effect fading from about $-1.6$ behind the line to about $-0.3$ on
+throws of 20+ yards, while the model applied about $-0.8$ everywhere; that
+over-spread the predictions for deep throws (`notes/decisions.md` §9.3). A
+plausible mechanism: `qb_hit` records a hit on the play, not its timing, and
+on deep throws the hit more often comes after the release.
+
+```{r}
+#| label: hit-by-depth
+
+hit_depths <- c(0, 10, 20, 30)
+hit_nd <- mf_complete[rep(1, length(hit_depths)), ] |>
+  mutate(air_yards = hit_depths, qb_hit = 1)
+hit_tm <- predict(f2, newdata = hit_nd, type = "terms", se.fit = TRUE)
+hit_eff <- tibble(
+  air_yards = hit_depths,
+  effect = hit_tm$fit[, "s(air_yards):qb_hit"],
+  se = hit_tm$se.fit[, "s(air_yards):qb_hit"]
+)
+
+hit_eff |>
+  gt() |>
+  tab_header(title = "Effect of a QB hit on the logit, by air yards") |>
+  fmt_number(columns = c(effect, se), decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+
+he <- function(a) sprintf("%.2f", hit_eff$effect[hit_eff$air_yards == a])
+```
+
+A hit lowers the logit by `r he(0)` at the line of scrimmage, `r he(10)` at 10
+yards, and `r he(20)` at 20 yards. Beyond about 35 yards the fitted effect turns
+slightly positive, which is implausible but indistinguishable from zero: few hit
+plays reach that depth and the band is wide (see the smooth plots below).
+
+Including `qb_hit` at all, rather than excluding hit plays, follows
+`notes/decisions.md` §7: the flag does not distinguish "hit during the throw"
+from "hit afterwards," so filtering on it would remove real passes and may
+itself select on outcome.
+
 ```{r}
 #| label: gam-check
 
@@ -524,14 +561,13 @@ kc <- k.check(f2)
 
 The basis dimension check is the part to read. `k-index` below $1$ with a small
 $p$-value suggests the basis is too small — *especially* when `edf` sits close to
-`k'`. The largest `edf` is `r sprintf("%.2f", max(kc[, "edf"]))` against `k'` of
-`r max(kc[, "k'"])`, and the penalty chooses well short of the available
-flexibility elsewhere. `s(number_of_pass_rushers)` reports a low `k-index`, but
-its `edf` is `r sprintf("%.2f", kc["s(number_of_pass_rushers)", "edf"])` of a
-possible `r kc["s(number_of_pass_rushers)", "k'"]`: the penalty chose a straight
-line, so a larger basis would not change the fit. The test orders observations by
-the covariate and compares neighbouring residuals, which is unreliable for a
-variable with six distinct values. The default bases are adequate.
+`k'`. Every `edf` sits well below its `k'`: the largest is
+`r sprintf("%.2f", max(kc[, "edf"]))`, for
+`r rownames(kc)[which.max(kc[, "edf"])]` with `k'` of
+`r kc[which.max(kc[, "edf"]), "k'"]`. The default bases are adequate. (For
+`number_of_pass_rushers`, which takes six values, the `k-index` test is
+unreliable in any case: it compares residuals of neighbouring observations,
+and most neighbours share a value.)
 
 Do not over-read the residual plots. Deviance residuals from a binomial fit on a
 binary response always separate into two arcs; that is a property of binary data
@@ -541,7 +577,7 @@ rather than a diagnosis.
 #| label: smooth-plots
 #| fig-height: 6
 
-par(mfrow = c(2, 2))
+par(mfrow = c(2, 3))
 plot(f2, shade = TRUE, seWithMean = TRUE, scale = 0)
 par(mfrow = c(1, 1))
 ```
@@ -1159,32 +1195,29 @@ p_cal_bucket
 **Calibration-in-the-large holds in every bucket**, for both stage 2 and `cp`:
 each CITL interval contains zero.
 
-**The slope does not hold for stage 2 on deep throws.** Within the 20+ bucket
-(`r comma(bk("2. play-by-play", "20+", "citl", "n"))` plays) the stage 2 slope is
+**Deep throws remain stage 2's weakest bucket.** Within 20+
+(`r comma(bk("2. play-by-play", "20+", "citl", "n"))` plays) its slope is
 `r sprintf("%.2f", bk("2. play-by-play", "20+", "slope"))`
 [`r sprintf("%.2f", bk("2. play-by-play", "20+", "slope", "conf_low"))`,
-`r sprintf("%.2f", bk("2. play-by-play", "20+", "slope", "conf_high"))`]:
-among deep throws, its predictions are spread considerably more than the
-outcomes support. `cp`'s slope in the same bucket is
-`r sprintf("%.2f", bk("cp", "20+", "slope"))`
+`r sprintf("%.2f", bk("2. play-by-play", "20+", "slope", "conf_high"))`],
+against `r sprintf("%.2f", bk("cp", "20+", "slope"))`
 [`r sprintf("%.2f", bk("cp", "20+", "slope", "conf_low"))`,
-`r sprintf("%.2f", bk("cp", "20+", "slope", "conf_high"))`]. In the other
-buckets both slopes are consistent with 1.
+`r sprintf("%.2f", bk("cp", "20+", "slope", "conf_high"))`] for `cp`. Before
+the QB-hit effect was allowed to vary with depth (§3.2), the stage 2 slope in
+this bucket was $0.62$ [$0.41$, $0.84$] (`notes/decisions.md` §9.6); the
+interaction removes part of the excess spread. A smaller, separate misfit
+remains: deep throws from inside the opponent's 30, which land in or near the
+end zone, complete less often than stage 2 predicts.
 
-Stage 2 is additive, so within the deep bucket its predictions still move with
-depth, field position, and the other terms at the strength those terms have
-across all throws. The slope says that on deep throws those effects are weaker
-than the model assumes. `cp`, which can represent interactions, does not show
-the same pattern, which is consistent with part of the §8 gap coming from deep
-throws. Two consequences:
+Stage 2's slope in the behind-the-line bucket is
+`r sprintf("%.2f", bk("2. play-by-play", "<= 0", "slope"))`
+[`r sprintf("%.2f", bk("2. play-by-play", "<= 0", "slope", "conf_low"))`,
+`r sprintf("%.2f", bk("2. play-by-play", "<= 0", "slope", "conf_high"))`]; that
+bucket leaves the population with the beyond-the-line-of-scrimmage filter.
 
-- Deep throws are where stage 2 is weakest, so they are where stages 3 and 4
-  have the most room; the stage 3–4 comparison should be reported by depth as
-  well as overall.
-- An interaction between depth and the other stage 2 terms would likely fix
-  this, but adding one now would change the baseline that geometry is measured
-  against. It is recorded as an open question rather than acted on
-  (`notes/decisions.md` §7).
+Deep throws are where stage 2 is weakest, so they are where stages 3 and 4 have
+the most room. The stage 3–4 comparison is reported by depth as well as
+overall.
 
 # 8. The `cp` benchmark
 

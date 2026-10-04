@@ -56,7 +56,10 @@ prepare_model_frame <- function(
 ) {
   stopifnot(
     all(df$pass_result %in% c("C", "I", "IN")),
-    !anyNA(df$pass_result)
+    !anyNA(df$pass_result),
+    # Used as a numeric `by` variable; a factor would fit one smooth per
+    # level instead.
+    is.numeric(df$qb_hit)
   )
 
   lump <- function(x) {
@@ -109,6 +112,10 @@ prepare_model_frame <- function(
 #' - `defenders_in_the_box` and `score_differential` are excluded.
 #' - `s(dist_to_sticks)` is kept although it fits as nearly linear; it is
 #'   the model's only `yards_to_go` information.
+#' - `qb_hit` enters as `s(air_yards, by = qb_hit)`, because its effect
+#'   weakens with depth (notes/decisions.md §9.3). A smooth with a numeric
+#'   `by` is not centered, so it carries the level of the hit effect and
+#'   there is no separate `qb_hit` term.
 #'
 #' `air_yards` is charted rather than measured and will be replaced by
 #' the tracking-derived throw distance once that exists. Fitted effects
@@ -130,12 +137,12 @@ MODEL_SPECS <- list(
       s(dist_to_sticks) +
       s(los_x) +
       s(number_of_pass_rushers, k = 5) +
+      s(air_yards, by = qb_hit) +
       air_yards_zero +
       down +
       pass_location +
       shotgun +
-      home +
-      qb_hit
+      home
   )
 )
 
