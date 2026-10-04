@@ -44,7 +44,6 @@ library(mgcv)
 
 source(here("R", "constants.R"))
 source(here("R", "utils.R"))
-source(here("R", "pbp.R"))
 source(here("R", "evaluate.R"))
 
 fig_dir <- here("figs", "week06")
@@ -58,20 +57,13 @@ This notebook reports. It reads persisted artifacts and writes nothing to
 `analysis/02_arrival_anchor.qmd`. Figures are written to `figs/week06/` and
 referenced statically from the slide deck.
 
-Two things about it are **provisional**, and both belong on the slide rather
-than in a footnote.
-
 ::: {.callout-important appearance="simple"}
 
-**The model frame is assembled here, in §1.1.** That assembly is
-`scripts/08_build_model_frame.R`'s job and that script does not exist yet.
-Nothing is written to disk, so the architectural rule holds, but these results
-are not yet reproducible from a build artifact.
-
-**The question's population filters are applied inline, in §1.2**: a targeted
-receiver (`notes/decisions.md` §4.9) and a ball that arrives beyond the line of
-scrimmage ($\text{depth}_{\text{arr}} > 0$, §7). Spikes and scrambles are
-already absent from the analytic sample. §1–8 report the floor, the
+**The model frame is built by `scripts/08_build_model_frame.R`** and read here
+from `model_frame.parquet`, with its population funnel from
+`model_funnel.parquet`. The population is the question's: a pass thrown to a
+targeted receiver (`notes/decisions.md` §4.9) that arrives beyond the line of
+scrimmage ($\text{depth}_{\text{arr}} > 0$, §7). §1–8 report the floor, the
 play-by-play baseline, and the external benchmark; §9 adds stage 3, separation
 at the throw; §10 adds stage 4, the rest of the coverage geometry.
 
@@ -80,236 +72,99 @@ at the throw; §10 adds stage 4, the rest of the coverage geometry.
 ```{r}
 #| label: load_data
 
-analytic_sample <- read_parquet(here(
-  "data",
-  "processed",
-  "analytic_sample.parquet"
-))
-plays <- read_parquet(here("data", "processed", "plays.parquet"))
-pbp <- read_parquet(here("data", "processed", "pbp.parquet"))
-arrival <- read_parquet(here("data", "processed", "arrival.parquet"))
-features <- read_parquet(here("data", "processed", "features.parquet"))
+model_frame <- read_parquet(here("data", "processed", "model_frame.parquet"))
+model_funnel <- read_parquet(here("data", "processed", "model_funnel.parquet"))
 
-# pbp.parquet does not carry receiver names yet, so they are read from the
-# nflverse mirror. 08 takes this over.
-receivers <- read_parquet(
-  here("data", "interim", "pbp_2018.parquet"),
-  col_select = c("old_game_id", "play_id", "receiver_player_name")
-) |>
-  standardize_pbp_keys()
+fn <- function(flag, col = "dropped") {
+  model_funnel[[col]][model_funnel$flag %in% flag]
+}
 ```
 
 # 1. The model frame
 
-## 1.1 Assembly
+## 1.1 Population
 
-Six sources, joined on `(game_id, play_id)`. The join takes from each table
-only the columns the other two lack, because `analytic_sample.parquet` already
-carries `down`, `yards_to_go`, `los_x`, and `week` — pulling them again would
-produce suffixed `.x` / `.y` pairs rather than an error.
+`08` starts from the base analytic sample (`notes/decisions.md` §4.5) and applies
+the question's rule, `QUESTION_RULE` in `R/sample_rules.R`:
 
-- `analytic_sample.parquet` — the spine, and the response via `pass_result`
-- `plays.parquet` — `number_of_pass_rushers`, which `04_build_sample.R` did not
-  carry forward because the sample rule did not need it
-- `pbp.parquet` — `pass_location`, `qb_hit`, `shotgun`, charted `air_yards`
-  (kept for comparison only),
-  `posteam_type`, and the benchmark columns `cp` / `has_cp`
-- the nflverse mirror — `receiver_player_name`, for the population filter in
-  §1.2
-- `arrival.parquet` — `depth_arr`, the tracking-derived depth that replaces
-  charted `air_yards` (`notes/decisions.md` §6.9), and the arrival diagnostics
-- `features.parquet` — the stage 3 and 4 features (§9, §10)
+- **Population:** a thrown pass; nflverse names a receiver, which is also the
+  condition under which it computes `cp`; not a spike or a scramble.
+- **Quality:** BDB's targeted receiver is tracked, without which no coverage
+  geometry can be measured; an arrival is measured (`arrival.parquet`).
+- **Population:** the ball arrives beyond the line of scrimmage. This follows
+  the quality steps because it can only be evaluated once the arrival is
+  measured.
+- **Quality:** every model input is defined.
 
-`plays.parquet` is not widened by re-running `04`: the analytical sample is a
-locked artifact of the sample layer, and adding model covariates to it would
-conflate the sample layer with the feature layer.
-
-```{r}
-#| label: assemble
-
-throws <- analytic_sample |>
-  left_join(
-    plays |> select(game_id, play_id, number_of_pass_rushers),
-    by = c("game_id", "play_id")
-  ) |>
-  left_join(pbp, by = c("game_id", "play_id")) |>
-  left_join(receivers, by = c("game_id", "play_id")) |>
-  left_join(
-    select(arrival, game_id, play_id, depth_arr, used_fallback, at_window_edge),
-    by = c("game_id", "play_id")
-  ) |>
-  left_join(
-    select(
-      features,
-      game_id,
-      play_id,
-      sep_throw,
-      closing_throw,
-      lev_angle,
-      tta_nearest,
-      window_margin,
-      window_n_pos
-    ),
-    by = c("game_id", "play_id")
-  ) |>
-  filter(pass_result %in% c("C", "I", "IN"))
-
-tibble(
-  quantity = c(
-    "plays in analytic_sample",
-    "thrown passes (C, I, IN)",
-    "removed: sacks carrying a throw event",
-    "matched to play-by-play",
-    "carrying the cp benchmark"
-  ),
-  n = c(
-    nrow(analytic_sample),
-    nrow(throws),
-    nrow(analytic_sample) - nrow(throws),
-    sum(throws$pbp_matched),
-    sum(throws$has_cp)
-  )
-) |>
-  mutate(pct_of_throws = n / nrow(throws)) |>
-  gt() |>
-  fmt_percent(columns = pct_of_throws, decimals = 1) |>
-  fmt_number(columns = n, decimals = 0) |>
-  gt_theme_538(quiet = TRUE)
-```
-
-Sacks are removed because they are not throws. `keep_any_throw` in the sample
-rule defines the population as plays where a forward pass was *released*
-(`notes/decisions.md` §4.6), and a sack carries a throw event on a small number
-of plays; this filter is on the outcome code rather than the event, so it
-catches those.
-
-## 1.2 Population: a targeted receiver, beyond the line
-
-nflverse computes `cp` only when a receiver is named, and the question is the
-completion probability of a pass *to a receiver*. Throwaways, intentional
-grounding, and passes with no identifiable target are out of scope
-(`notes/decisions.md` §4.9). The question is also about passes thrown beyond
-the line of scrimmage; screens and other throws at or behind it have different
-coverage dynamics (§7). Four steps, applied here until
-`scripts/08_build_model_frame.R` exists:
-
-- **Population:** nflverse names a receiver.
-- **Quality:** BDB's targeted receiver is tracked. Without that, no coverage
-  geometry can be measured.
-- **Quality:** an arrival is measured (`arrival.parquet`).
-- **Population:** the ball arrives beyond the line,
-  $\text{depth}_{\text{arr}} > 0$.
-
-Like every exclusion, each step is checked for a differential completion rate.
+Like every exclusion, each step is reported with the completion rate of the
+plays it keeps and drops.
 
 ```{r}
 #| label: population
 
-pop <- throws |>
-  mutate(
-    receiver_named = !is.na(receiver_player_name),
-    target_tracked = coalesce(target_tracked, FALSE),
-    is_complete = pass_result == "C"
-  )
-
-everything <- rep(TRUE, nrow(pop))
-named <- pop$receiver_named
-tracked <- named & pop$target_tracked
-arrived <- tracked & !is.na(pop$depth_arr)
-beyond <- arrived & pop$depth_arr > 0
-
-pop_funnel <- tibble(
-  step = c(
-    "thrown passes",
-    "nflverse receiver named (population)",
-    "targeted receiver tracked (quality)",
-    "arrival measured (quality)",
-    "ball arrives beyond the line (population)"
-  ),
-  keep = list(everything, named, tracked, arrived, beyond),
-  before = list(everything, everything, named, tracked, arrived)
-) |>
-  mutate(
-    dropped = map2_int(before, keep, \(b, k) sum(b & !k)),
-    remaining = map_int(keep, sum),
-    complete_kept = map_dbl(keep, \(k) mean(pop$is_complete[k])),
-    complete_dropped = map2_dbl(
-      before,
-      keep,
-      \(b, k) if (any(b & !k)) mean(pop$is_complete[b & !k]) else NA_real_
-    )
+model_funnel |>
+  select(
+    step,
+    group,
+    dropped,
+    remaining,
+    complete_kept = outcome_kept,
+    complete_dropped = outcome_dropped
   ) |>
-  select(-keep, -before)
-
-pop_funnel |>
   gt() |>
   fmt_number(columns = c(dropped, remaining), decimals = 0) |>
   fmt_percent(columns = c(complete_kept, complete_dropped), decimals = 1) |>
   sub_missing(missing_text = "") |>
   gt_theme_538(quiet = TRUE)
-
-model_input <- pop[beyond, ]
-
-# The benchmark is defined on every play in the population.
-stopifnot(all(model_input$has_cp))
 ```
 
-The `r comma(pop_funnel$dropped[2])` throws with no named receiver complete at
-`r percent(pop_funnel$complete_dropped[2], accuracy = 0.1)`: throwaways,
-grounding, and untargeted passes. Excluding them is a definition of the
-population, not attrition, and it is the same exclusion nflverse makes for
-`cp`. The `r pop_funnel$dropped[3]` targeted receivers who are not tracked
-complete at `r percent(pop_funnel$complete_dropped[3], accuracy = 0.1)`, the
-opposite skew. That is a measurement loss, small enough to state rather than
-correct. `r pop_funnel$dropped[4]` more have no measured arrival.
+The first step removes `r fn("keep_thrown")` sacks that carry a throw event.
+The `r comma(fn("keep_receiver_named"))` throws with no named receiver complete
+at `r percent(fn("keep_receiver_named", "outcome_dropped"), accuracy = 0.1)`:
+throwaways, grounding, and untargeted passes. Excluding them is a definition of
+the population, not attrition, and it is the same exclusion nflverse makes for
+`cp`. Spikes and scrambles never reach the base sample's throw population, so
+those two steps are tripwires and drop nothing.
 
-The beyond-the-line filter removes `r comma(pop_funnel$dropped[5])` throws,
-which complete at `r percent(pop_funnel$complete_dropped[5], accuracy = 0.1)`
-against `r percent(pop_funnel$complete_kept[5], accuracy = 0.1)` for those kept:
-screens and other throws at the line are easy completions. It is a population
-definition, stated with its composition.
+The `r fn("keep_target_tracked")` targeted receivers who are not tracked
+complete at
+`r percent(fn("keep_target_tracked", "outcome_dropped"), accuracy = 0.1)`, the
+opposite skew: a measurement loss, small enough to state rather than correct.
+`r fn("keep_arrival_measured")` more have no measured arrival.
+
+The beyond-the-line filter removes `r comma(fn("keep_beyond_los"))` throws,
+which complete at
+`r percent(fn("keep_beyond_los", "outcome_dropped"), accuracy = 0.1)` against
+`r percent(fn("keep_beyond_los", "outcome_kept"), accuracy = 0.1)` for those
+kept: screens and other throws at the line are easy completions. It is a
+population definition, stated with its composition.
+
+Finally, `r fn("keep_model_inputs")` plays lack a model input
+(`scripts/07_build_features.R`): `closing_throw`, `tta_nearest`, or
+`window_margin` is undefined where a player's direction is missing at the
+throw, and `lev_angle` where the ball did not move between the throw and
+arrival frames. The requirement is the union across all specs, so these plays
+leave every stage, not just the one that needs the feature.
 
 Every play that remains carries `cp`, so the stages and the benchmark are scored
 on the same rows.
 
-## 1.3 Derived predictors
+## 1.2 Derived predictors
 
-`prepare_model_frame()` in `R/evaluate.R` owns the response and two derived
-columns, so that every stage and the benchmark see identical inputs. The
-reasoning for each is in that file's header; the observable effects:
+`prepare_model_frame()` in `R/evaluate.R`, applied by `08`, adds the response
+and two derived columns, so that every stage and the benchmark see identical
+inputs:
 
-```{r}
-#| label: prepare
+- `complete` is 1 for C and 0 for I and IN. An interception counts as an
+  incompletion, which is how nflverse `cp` is defined and what makes the
+  benchmark comparison meaningful.
+- `dist_to_sticks = depth_arr - yards_to_go` replaces `yards_to_go`.
+- `home` is 1 when the offense is at home.
 
-mf <- prepare_model_frame(model_input)
+It also clamps `number_of_pass_rushers` to [2, 7] and lumps rare factor levels;
+the reasoning is in that file and in `notes/decisions.md` §9.2.
 
-tibble(
-  transformation = c(
-    "response: complete = 1 for C, 0 for I and IN",
-    "number_of_pass_rushers clamped to [2, 7]",
-    "dist_to_sticks = depth_arr - yards_to_go",
-    "home = posteam_type == 'home'"
-  ),
-  affected = c(
-    sum(mf$complete),
-    sum(
-      model_input$number_of_pass_rushers != mf$number_of_pass_rushers,
-      na.rm = TRUE
-    ),
-    sum(!is.na(mf$dist_to_sticks)),
-    sum(mf$home, na.rm = TRUE)
-  )
-) |>
-  gt() |>
-  fmt_number(columns = affected, decimals = 0) |>
-  gt_theme_538(quiet = TRUE)
-```
-
-An interception counts as an incompletion. This is how nflverse `cp` is defined,
-and matching it is what makes the benchmark comparison meaningful rather than a
-comparison of two different response variables.
-
-## 1.4 The scoring population
+## 1.3 The scoring population
 
 Every stage's log loss has to be computed on the same rows, or the *differences*
 between stages are not differences. `glm()` and `mgcv::gam()` default to
@@ -317,69 +172,23 @@ between stages are not differences. `glm()` and `mgcv::gam()` default to
 quietly fit and score fewer plays than the stage below it — no warning, no
 error, and a delta computed across two different datasets.
 
-`assert_complete()` therefore **asserts rather than filters**. Dropping rows is
-an exclusion, exclusions are checked for differential completion rates and
-logged with counts (`notes/decisions.md` §4.7), and the modeling layer is not
-permitted to change the population silently.
+`assert_complete()` therefore **asserts rather than filters**; the exclusion is
+the last step of the funnel in §1.1, where its composition is reported.
 
 ```{r}
-#| label: required-vars
+#| label: scoring-population
 
 tibble(variable = model_vars()) |>
   gt() |>
   tab_header(title = "Columns required by MODEL_SPECS") |>
   gt_theme_538(quiet = TRUE)
-```
 
-```{r}
-#| label: incomplete-columns
-
-rep <- incomplete_report(mf)
-n_incomplete <- sum(!complete.cases(mf[model_vars()]))
-
-rep$by_column |>
-  gt() |>
-  fmt_percent(columns = pct_missing, decimals = 4) |>
-  gt_theme_538(quiet = TRUE)
-```
-
-`r n_incomplete` plays in this population are missing a required variable
-(`scripts/07_build_features.R`): `closing_throw`, `tta_nearest`, or
-`window_margin` is undefined where a player's direction is missing at the
-throw, and `lev_angle` where the ball did not move between the throw and
-arrival frames. The requirement is the union across all specs, so these plays
-leave every stage, not just the one that needs the feature. Their outcome
-composition is below.
-
-```{r}
-#| label: incomplete-composition
-
-rep$composition |>
-  gt() |>
-  fmt_percent(columns = share, decimals = 1) |>
-  gt_theme_538(quiet = TRUE)
-```
-
-```{r}
-#| label: scoring-population
-
-vars <- model_vars()
-mf_complete <- filter(mf, complete.cases(mf[vars]))
-
-assert_complete(mf_complete)
+mf_complete <- assert_complete(model_frame)
 
 tibble(
-  quantity = c(
-    "thrown passes",
-    "complete cases across all specs",
-    "dropped",
-    "completions",
-    "base rate"
-  ),
+  quantity = c("plays", "completions", "base rate"),
   value = c(
-    comma(nrow(mf)),
     comma(nrow(mf_complete)),
-    comma(nrow(mf) - nrow(mf_complete)),
     comma(sum(mf_complete$complete)),
     sprintf("%.4f", mean(mf_complete$complete))
   )
@@ -1607,9 +1416,7 @@ to a calibrated play-by-play baseline — lowers out-of-fold log loss by
 `r sprintf("%.4f", -d32$estimate)` nats
 [`r sprintf("%.4f", -d32$conf_high)`, `r sprintf("%.4f", -d32$conf_low)`] and
 moves the model from `r sprintf("%.4f", d2cp$estimate)` nats behind `cp` to
-`r sprintf("%.4f", -d3cp$estimate)` ahead of it. These are provisional numbers:
-the model frame is assembled in this notebook rather than by `08`, and stage 4
-is still to come.
+`r sprintf("%.4f", -d3cp$estimate)` ahead of it. Stage 4 follows in §10.
 
 # 10. Stage 4: coverage geometry
 
@@ -1927,5 +1734,6 @@ over the base rate. Separation accounts for
 to arrival, and the passing window for the rest. `cp`, partly in-sample for
 2018 and with a more flexible model class, sits between stages 2 and 3.
 
-These numbers are provisional until `scripts/08_build_model_frame.R` builds the
-model frame; the inline assembly in §1 is what `08` will reproduce.
+The model frame these numbers are computed on is a build artifact
+(`scripts/08_build_model_frame.R`), so they are reproducible from `data/`
+without this notebook's assembly code.

@@ -65,9 +65,12 @@ PBP_LEAK_PATTERNS <- c(
 #'
 #' The `validate` block encodes the outcome and is kept only for join
 #' validation; it must be dropped from any model frame.
+#' `receiver_player_name` defines the targeted-receiver population
+#' (notes/decisions.md §4.9).
 PBP_COLS <- list(
   keys = c("game_id", "play_id", "week"),
   benchmark = c("cp"),
+  target = c("receiver_player_name"),
   throw = c("air_yards", "pass_location", "pass_length"),
   pressure = c("qb_hit", "qb_spike", "qb_scramble", "qb_dropback"),
   context = c(

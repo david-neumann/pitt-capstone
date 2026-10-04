@@ -1,8 +1,13 @@
 # R/sample_rules.R -----------------------------------------------------
 # Sample definition: exclusion flags, the rules that combine them, and
-# funnel reporting. Applied by scripts/04_build_sample.R. Inputs are
-# measured columns from data/processed/play_index.parquet and
-# plays.parquet.
+# funnel reporting.
+#
+# Two layers. The base sample (FLAG_LABELS, SAMPLE_RULE) is
+# question-agnostic and applied by scripts/04_build_sample.R from
+# play_index.parquet and plays.parquet. The question-level population
+# (QUESTION_FLAG_LABELS, QUESTION_RULE) is applied on top of it by
+# scripts/08_build_model_frame.R, which also needs pbp.parquet,
+# arrival.parquet, and features.parquet.
 
 source(here::here("R", "coverage.R"))
 
@@ -32,15 +37,15 @@ FLAG_LABELS <- c(
 #' flags first so that each quality step's funnel count is measurement
 #' loss only.
 #'
-#' `keep_arrival` is a diagnostic only and must not appear in a rule: the
-#' `pass_arrived` event it tests is missing far more often on
-#' incompletions (notes/decisions.md §4.8, §6.1).
+#' `keep_arrival` is a diagnostic only (group "diagnostic") and must not
+#' appear in a rule: the `pass_arrived` event it tests is missing far more
+#' often on incompletions (notes/decisions.md §4.8, §6.1).
 FLAG_GROUP <- c(
   keep_live_play = "population",
   keep_snap = "population",
   keep_throw = "population",
   keep_any_throw = "population",
-  keep_arrival = "population",
+  keep_arrival = "diagnostic",
   keep_target = "population",
   keep_coverage = "population",
   keep_los = "quality",
@@ -192,9 +197,22 @@ flag_marginals <- function(df, flags = names(FLAG_LABELS)) {
 
 #' Step-by-step attrition for an ordered set of flags
 #'
+#' @param df A data frame carrying the flags.
+#' @param flags Flag names, in order.
+#' @param labels,groups Named vectors describing the flags.
+#' @param outcome Optional logical vector, the length of `nrow(df)`. When
+#'   given, the share of `outcome` among plays kept and dropped at each
+#'   step is added, so every exclusion can be checked for selection on the
+#'   outcome.
 #' @return One row per step, starting with "all plays": `dropped` is
 #'   conditional on every earlier step.
-funnel <- function(df, flags, labels = FLAG_LABELS, groups = FLAG_GROUP) {
+funnel <- function(
+  df,
+  flags,
+  labels = FLAG_LABELS,
+  groups = FLAG_GROUP,
+  outcome = NULL
+) {
   stopifnot(
     all(flags %in% names(labels)),
     all(flags %in% names(groups)),
@@ -209,7 +227,7 @@ funnel <- function(df, flags, labels = FLAG_LABELS, groups = FLAG_GROUP) {
 
   counts <- purrr::map_int(masks, sum)
 
-  tibble::tibble(
+  out <- tibble::tibble(
     step_index = seq_along(counts) - 1L,
     flag = c(NA_character_, flags),
     group = c(NA_character_, unname(groups[flags])),
@@ -218,4 +236,90 @@ funnel <- function(df, flags, labels = FLAG_LABELS, groups = FLAG_GROUP) {
     remaining = counts,
     pct_of_start = counts / nrow(df)
   )
+
+  if (!is.null(outcome)) {
+    stopifnot(is.logical(outcome), length(outcome) == nrow(df), !anyNA(outcome))
+    share <- function(m) if (any(m)) mean(outcome[m]) else NA_real_
+    out$outcome_kept <- purrr::map_dbl(masks, share)
+    out$outcome_dropped <- c(
+      NA_real_,
+      purrr::map2_dbl(masks[-length(masks)], masks[-1], \(b, k) share(b & !k))
+    )
+  }
+
+  out
+}
+
+
+# ---- the question-level population -----------------------------------
+
+#' Labels for the question-level flags, applied by 08_build_model_frame.R
+QUESTION_FLAG_LABELS <- c(
+  keep_thrown = "thrown pass (C, I, IN)",
+  keep_receiver_named = "nflverse names a receiver",
+  keep_not_spike = "not a QB spike",
+  keep_not_scramble = "not a QB scramble",
+  keep_target_tracked = "BDB targeted receiver tracked",
+  keep_arrival_measured = "arrival measured",
+  keep_beyond_los = "ball arrives beyond the line of scrimmage",
+  keep_model_inputs = "every model input defined"
+)
+
+#' Population or quality, as for the base flags
+QUESTION_FLAG_GROUP <- c(
+  keep_thrown = "population",
+  keep_receiver_named = "population",
+  keep_not_spike = "population",
+  keep_not_scramble = "population",
+  keep_target_tracked = "quality",
+  keep_arrival_measured = "quality",
+  keep_beyond_los = "population",
+  keep_model_inputs = "quality"
+)
+
+stopifnot(setequal(names(QUESTION_FLAG_LABELS), names(QUESTION_FLAG_GROUP)))
+
+#' The question's population, in funnel order
+#'
+#' Population flags first, except `keep_beyond_los`: whether the ball
+#' arrives beyond the line can only be evaluated once the arrival is
+#' measured, so it follows the quality steps that make it measurable.
+#' Spikes and scrambles are already absent from the base sample; their
+#' flags are tripwires that should drop no plays. See notes/decisions.md
+#' §4.9 and §7.
+QUESTION_RULE <- c(
+  "keep_thrown",
+  "keep_receiver_named",
+  "keep_not_spike",
+  "keep_not_scramble",
+  "keep_target_tracked",
+  "keep_arrival_measured",
+  "keep_beyond_los",
+  "keep_model_inputs"
+)
+
+stopifnot(setequal(QUESTION_RULE, names(QUESTION_FLAG_LABELS)))
+
+#' Attach the question-level flags, except `keep_model_inputs`
+#'
+#' `keep_model_inputs` depends on derived columns that
+#' prepare_model_frame() adds, so 08_build_model_frame.R sets it after
+#' preparing the plays that pass every earlier step.
+#'
+#' @param df Analytic-sample plays joined to pbp.parquet (`qb_spike`,
+#'   `qb_scramble`, `receiver_player_name`) and arrival.parquet
+#'   (`depth_arr`).
+#' @return `df` with the `keep_*` flags in QUESTION_FLAG_LABELS other than
+#'   `keep_model_inputs`; never NA.
+add_question_flags <- function(df) {
+  df |>
+    dplyr::mutate(
+      keep_thrown = dplyr::coalesce(pass_result %in% c("C", "I", "IN"), FALSE),
+      keep_receiver_named = !is.na(receiver_player_name),
+      keep_not_spike = !dplyr::coalesce(qb_spike == 1, FALSE),
+      keep_not_scramble = !dplyr::coalesce(qb_scramble == 1, FALSE),
+      keep_target_tracked = dplyr::coalesce(target_tracked, FALSE),
+      keep_arrival_measured = !is.na(depth_arr),
+      keep_beyond_los = dplyr::coalesce(depth_arr > 0, FALSE)
+    )
 }

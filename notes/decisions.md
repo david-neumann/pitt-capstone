@@ -33,7 +33,7 @@ written as a side effect of rendering `analysis/01_eda.qmd`.
 | `05_join_pbp.R` | built | Pulls and mirrors nflverse play-by-play; emits `pbp.parquet` on the plays keys. Measured facts only. |
 | `06_build_throw_frame.R` | built | Applies `R/arrival.R` at season scale; emits `arrival.parquet`, `approach.parquet`, and the throw-frame slice `throw_frame.parquet` (§6.9). Measured facts only; no outcome columns. |
 | `07_build_features.R` | built | Throw-frame coverage features; emits `features.parquet`: separation and closing speed (stage 3, §9.8); leverage, time to arrival, and the passing window (stage 4, §9.9). |
-| `08_build_model_frame.R` | planned | Model-frame assembly, question-level population filters with their own funnel, leak assertions. |
+| `08_build_model_frame.R` | built | Applies `QUESTION_RULE` on top of the analytic sample, prepares predictors, asserts completeness and the absence of leak columns; emits `model_frame.parquet` and `model_funnel.parquet` (§9.1). |
 
 | Helper / notebook | Owns |
 |---|---|
@@ -43,7 +43,7 @@ written as a side effect of rendering `analysis/01_eda.qmd`.
 | `R/evaluate.R` | Model frame preparation, model specs, cross-validation harness, scoring (§9). |
 | `analysis/01_eda.qmd` | Data audit and sample-definition report. Writes nothing. |
 | `analysis/02_arrival_anchor.qmd` | Arrival-anchor investigation. Writes nothing. |
-| `analysis/03_model_baseline.qmd` | Baseline models and scoring. Writes nothing to `data/`; assembles the model frame inline until `08` exists. |
+| `analysis/03_model_baseline.qmd` | Models, scoring, calibration, and the `cp` benchmark, on `model_frame.parquet`. Writes nothing to `data/`. |
 | `analysis/04_arrival_season.qmd` | Season-scale validation of the arrival anchor (§6.9). Writes nothing. |
 
 `R/arrival.R` exists as a helper rather than living inside `06` because the
@@ -355,10 +355,9 @@ on half of all incompletions, so it is neither a population definition nor
 ignorable attrition.
 
 The flag stays in `FLAG_LABELS` and `flag_marginals()` as a diagnostic (4,654
-plays fail it) and appears in no rule — verified for both `SCOPED_FLAGS` and
-`CONSERVATIVE_FLAGS`. It must not enter the `08` funnel. `FLAG_GROUP` still
-labels it `"population"`; relabeling it is pending (§7). Arrival is derived, not
-read.
+plays fail it), labeled `"diagnostic"` in `FLAG_GROUP`, and appears in no rule
+— verified for `SCOPED_FLAGS`, `CONSERVATIVE_FLAGS`, and `QUESTION_RULE`.
+Arrival is derived, not read.
 
 ### 4.9 Adopted: a targeted receiver is part of the population
 
@@ -367,9 +366,7 @@ receiver, matching nflverse, which computes `cp` only when a receiver is named
 (§8.4). Throwaways, spikes, intentional grounding, and passes with no
 identifiable target are out of scope: the question is the completion
 probability of a pass to a receiver, and these have none. Applied in `08`
-(§0); until `08` exists, applied inline in `analysis/03_model_baseline.qmd`
-§1.2, which reads `receiver_player_name` from the nflverse mirror because
-`pbp.parquet` does not carry it yet.
+(§0, §9.1).
 
 On the 17,077 thrown passes in the analytic sample, BDB's targeted receiver
 (`targetedReceiver.csv`, tracked) against nflverse's `receiver_player_name`:
@@ -396,9 +393,10 @@ recorded in BDB also has none in nflverse.
   model population and the benchmark's scoring population coincide, so the
   `has_cp` base-rate shift (§8.3) does not arise once this filter is applied.
 
-**Implementation.** `keep_target` currently conflates "named" and "tracked".
-`08` splits it into a population flag (receiver named) and a quality flag
-(target tracked).
+**Implementation.** `QUESTION_RULE` in `R/sample_rules.R`, applied by `08`,
+splits the base sample's `keep_target` into `keep_receiver_named` (population,
+from nflverse `receiver_player_name`, now carried in `pbp.parquet`) and
+`keep_target_tracked` (quality).
 
 **Untargeted interceptions.** Four interceptions have no receiver in either
 source. Reviewed on video: each is an unusual play for its own reason, and
@@ -414,8 +412,8 @@ throw.
 
 **Spikes and scrambles are already out.** All 75 `qb_spike` plays fail
 `keep_live_play` and `keep_any_throw`; all 7 `qb_scramble` plays fail
-`keep_any_throw`. Separate spike and scramble filters in `08` would remove
-zero plays and serve only as tripwires.
+`keep_any_throw`. `08` keeps `keep_not_spike` and `keep_not_scramble` as
+tripwires and asserts that they remove zero plays.
 
 ---
 
@@ -824,12 +822,8 @@ cross-validation. Details in §9.
   the 13-game denominator.
 - **QB kinematic state** — listed among the geometry features in earlier
   framing but not assigned to stage 3 or 4.
-- **`FLAG_GROUP` relabel** for `keep_arrival` (§4.8).
 - **Robustness: charted `air_yards`.** Refit stage 2 with charted `air_yards`
   in place of $\text{depth}_{\text{arr}}$ (§9.3).
-- **`receiver_player_name` in `pbp.parquet`.** Add it to `PBP_COLS` and re-run
-  `05` (a rebuild of `data/processed/pbp.parquet`, no network) so `08` does not
-  read the interim mirror.
 
 ### Play types measurable but not yet filtered
 
@@ -849,11 +843,9 @@ inappropriate for this question:
 
 ### Feature state
 
-`R/geometry.R`, `R/arrival.R`, `R/pbp.R`, `R/evaluate.R`, and scripts 01–07
-exist. `arrival.parquet`, `throw_frame.parquet`, and `features.parquet` are
-built. Stages 1–4 are fit and scored on the final population (§9). The model
-frame is still assembled in `analysis/03_model_baseline.qmd`;
-`08_build_model_frame.R` is next.
+The full pipeline, scripts 01–08, is built. `model_frame.parquet` (13,125
+throws) is the scoring population for stages 1–4 and the `cp` benchmark (§9).
+Remaining work is robustness checks and the report.
 
 ### Deferred to future work
 
@@ -1029,28 +1021,29 @@ are rejected in the model frame.
 ## 9. Models and evaluation
 
 Implemented in `R/evaluate.R`, reported in `analysis/03_model_baseline.qmd`.
-The model frame is assembled in the notebook, with the question's population
-filters applied inline until `08` exists. Numbers are on that final population
-unless marked otherwise; results on earlier populations are summarized in §9.10.
+The model frame is built by `scripts/08_build_model_frame.R`. Numbers are on
+that final population unless marked otherwise; results on earlier populations
+are summarized in §9.10.
 
 ### 9.1 Response and scoring population
 
 `complete = 1` for C; I and IN are 0, which matches nflverse `cp` and makes the
 benchmark comparable.
 
-The model frame joins `analytic_sample.parquet`, `number_of_pass_rushers` from
-`plays.parquet`, `pbp.parquet`, `receiver_player_name` from the nflverse mirror,
-`arrival.parquet`, and `features.parquet`, restricted to `pass_result` in
-{C, I, IN}:
+`08` joins `analytic_sample.parquet`, `number_of_pass_rushers` from
+`plays.parquet`, `pbp.parquet`, `arrival.parquet`, and `features.parquet`, and
+applies `QUESTION_RULE` (`model_funnel.parquet`):
 
 | Step | Dropped | Remaining | Complete (kept) | Complete (dropped) |
 |---|---|---|---|---|
-| thrown passes | — | 17,077 | 65.3% | — |
+| analytic sample | — | 17,081 | 65.3% | — |
+| thrown pass, C / I / IN (population) | 4 | 17,077 | 65.3% | 0.0% |
 | nflverse receiver named (population, §4.9) | 409 | 16,668 | 66.9% | 0.2% |
+| not a spike; not a scramble (tripwires) | 0 | 16,668 | 66.9% | — |
 | targeted receiver tracked (quality) | 25 | 16,643 | 66.9% | 84.0% |
 | arrival measured (quality, §6.9) | 3 | 16,640 | 66.9% | 0.0% |
 | ball arrives beyond the line, $\text{depth}_{\text{arr}} > 0$ (population, §7) | 3,493 | 13,147 | 63.8% | 78.4% |
-| complete cases across all specs | 22 | **13,125** | 63.8% | 72.7% |
+| every model input defined (quality) | 22 | **13,125** | 63.8% | 72.7% |
 
 The 22 complete-case drops (16 completions, 6 incompletions; 0.2% of throws)
 lack a stage 3 or 4 input: a player's direction is missing at the throw, which
@@ -1419,8 +1412,6 @@ at the throw lowers out-of-fold log loss by 0.0563 nats [0.0503, 0.0622], more
 than the 0.0554 that the play-by-play features gain over the base rate.
 Separation accounts for 79% of it; leverage, time to arrival, and the passing
 window for the rest. `cp` sits between stages 2 and 3.
-
-These numbers are provisional until `08` builds the model frame.
 
 ### 9.10 Results on earlier populations
 
