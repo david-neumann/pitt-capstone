@@ -73,7 +73,7 @@ receiver (`notes/decisions.md` §4.9) and a ball that arrives beyond the line of
 scrimmage ($\text{depth}_{\text{arr}} > 0$, §7). Spikes and scrambles are
 already absent from the analytic sample. §1–8 report the floor, the
 play-by-play baseline, and the external benchmark; §9 adds stage 3, separation
-at the throw. Stage 4 features do not exist yet.
+at the throw; §10 adds stage 4, the rest of the coverage geometry.
 
 :::
 
@@ -118,7 +118,7 @@ produce suffixed `.x` / `.y` pairs rather than an error.
   §1.2
 - `arrival.parquet` — `depth_arr`, the tracking-derived depth that replaces
   charted `air_yards` (`notes/decisions.md` §6.9), and the arrival diagnostics
-- `features.parquet` — the stage 3 features (§9)
+- `features.parquet` — the stage 3 and 4 features (§9, §10)
 
 `plays.parquet` is not widened by re-running `04`: the analytical sample is a
 locked artifact of the sample layer, and adding model covariates to it would
@@ -139,7 +139,17 @@ throws <- analytic_sample |>
     by = c("game_id", "play_id")
   ) |>
   left_join(
-    select(features, game_id, play_id, sep_throw, closing_throw),
+    select(
+      features,
+      game_id,
+      play_id,
+      sep_throw,
+      closing_throw,
+      lev_angle,
+      tta_nearest,
+      window_margin,
+      window_n_pos
+    ),
     by = c("game_id", "play_id")
   ) |>
   filter(pass_result %in% c("C", "I", "IN"))
@@ -333,11 +343,13 @@ rep$by_column |>
   gt_theme_538(quiet = TRUE)
 ```
 
-`r n_incomplete` plays in this population are missing a required variable:
-`closing_throw` is undefined where the direction of the receiver or the nearest
-defender is missing at the throw (`scripts/07_build_features.R`). The
-requirement is the union across all specs, so these plays leave every stage,
-not just stage 3. Their outcome composition is below.
+`r n_incomplete` plays in this population are missing a required variable
+(`scripts/07_build_features.R`): `closing_throw`, `tta_nearest`, or
+`window_margin` is undefined where a player's direction is missing at the
+throw, and `lev_angle` where the ball did not move between the throw and
+arrival frames. The requirement is the union across all specs, so these plays
+leave every stage, not just the one that needs the feature. Their outcome
+composition is below.
 
 ```{r}
 #| label: incomplete-composition
@@ -1598,3 +1610,322 @@ moves the model from `r sprintf("%.4f", d2cp$estimate)` nats behind `cp` to
 `r sprintf("%.4f", -d3cp$estimate)` ahead of it. These are provisional numbers:
 the model frame is assembled in this notebook rather than by `08`, and stage 4
 is still to come.
+
+# 10. Stage 4: coverage geometry
+
+## 10.1 The features
+
+All at the throw frame, from `scripts/07_build_features.R`, on the lane from the
+ball at the throw, $\mathbf{x}_0$, to the arrival point, $\mathbf{x}_1$, with
+unit direction $\mathbf{u}$ and flight time $T$.
+
+**Leverage** of the nearest defender $j^*$ (§9.1). With
+$\boldsymbol{\delta} = \mathbf{x}_{j^*} - \mathbf{x}_r$,
+$\ell_\parallel = \boldsymbol{\delta} \cdot \mathbf{u}$ is the offset along the
+lane and $\ell_\perp$ the signed offset across it, re-signed so that positive
+means toward the middle of the field (`to_inside_outside()`). Because
+$\ell_\parallel^2 + \ell_\perp^2 = \text{sep}^2$ and stage 3 already has
+$\text{sep}$, leverage enters as a direction only:
+
+$$
+\texttt{lev\_angle} = \operatorname{atan2}(\ell_\perp, \ell_\parallel),
+$$
+
+0 when the defender is over the top, $\pm\pi$ underneath, $+\pi/2$ inside,
+$-\pi/2$ outside. It is an angle, so it enters as a cyclic smooth on
+$[-\pi, \pi]$.
+
+**Time to arrival** of the nearest defender, with $\tau_j(\mathbf{p})$ the time
+for defender $j$ to reach point $\mathbf{p}$ (`time_to_point()`, attainable
+top speed and acceleration from `R/constants.R`):
+
+$$
+\texttt{tta\_nearest} = T - \tau_{j^*}(\mathbf{x}_1),
+$$
+
+positive when the defender can reach the arrival point before the ball.
+
+**Passing window**: for each defender $j \ne j^*$, the best margin by which they
+can reach the lane ahead of the ball, with the ball at
+$\mathbf{x}_0 + u(\mathbf{x}_1 - \mathbf{x}_0)$ at time $uT$:
+
+$$
+\texttt{window\_margin} =
+\max_{j \ne j^*} \; \max_{u \in \{0, 0.05, \ldots, 1\}}
+\big[\, uT - \tau_j\big(\mathbf{x}_0 + u(\mathbf{x}_1 - \mathbf{x}_0)\big) \big],
+$$
+
+positive when some help defender can get into the ball's path in time
+(`notes/decisions.md` §7). The ball is assumed to travel the lane at constant
+speed, and there is no ball height, so a defender who can reach the middle of a
+high deep throw counts as in the window.
+
+Stage 4 is stage 3 plus `s(lev_angle, bs = "cc")`, `s(tta_nearest)`, and
+`s(window_margin)`.
+
+```{r}
+#| label: geo-descriptive
+
+geo_desc <- function(x, breaks, labels, name) {
+  mf_complete |>
+    mutate(bin = cut(.data[[x]], breaks, labels = labels, include.lowest = TRUE)) |>
+    group_by(bin) |>
+    summarize(plays = n(), completion = mean(complete), .groups = "drop") |>
+    mutate(feature = name)
+}
+
+bind_rows(
+  geo_desc(
+    "tta_nearest",
+    c(-Inf, -1, -0.5, 0, 0.5, Inf),
+    c("< -1", "-1 to -0.5", "-0.5 to 0", "0 to 0.5", "> 0.5"),
+    "tta_nearest (s)"
+  ),
+  geo_desc(
+    "window_margin",
+    c(-Inf, -1, -0.5, 0, 0.5, Inf),
+    c("< -1", "-1 to -0.5", "-0.5 to 0", "0 to 0.5", "> 0.5"),
+    "window_margin (s)"
+  )
+) |>
+  gt(groupname_col = "feature") |>
+  tab_header(title = "Completion rate by time-based margins at the throw") |>
+  fmt_number(columns = plays, decimals = 0) |>
+  fmt_percent(columns = completion, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+On `r percent(mean(mf_complete$window_n_pos > 0), accuracy = 0.1)` of throws at
+least one help defender can reach the lane ahead of the ball.
+
+## 10.2 Stage 4, interpreted
+
+```{r}
+#| label: stage4-fit
+
+f4 <- fit_full(mf_complete, MODEL_SPECS[["4. + geometry"]])
+st4 <- summary(f4)$s.table
+geo_rows <- c("s(lev_angle)", "s(tta_nearest)", "s(window_margin)")
+
+st4[geo_rows, , drop = FALSE] |>
+  as.data.frame() |>
+  rownames_to_column("smooth") |>
+  rename(p = `p-value`) |>
+  gt() |>
+  fmt_number(columns = c(edf, Ref.df, Chi.sq), decimals = 2) |>
+  fmt_scientific(columns = p, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: stage4-smooths
+#| fig-height: 4
+
+par(mfrow = c(1, 3))
+for (i in match(geo_rows, rownames(st4))) {
+  plot(f4, select = i, shade = TRUE, seWithMean = TRUE, scale = 0)
+}
+par(mfrow = c(1, 1))
+```
+
+Deviance explained in-sample:
+`r percent(summary(f3)$dev.expl, accuracy = 0.01)` (stage 3),
+`r percent(summary(f4)$dev.expl, accuracy = 0.01)` (stage 4).
+
+## 10.3 Out of fold
+
+```{r}
+#| label: stage4-cv
+
+preds4 <- cv_predict(
+  mf_complete,
+  folds,
+  MODEL_SPECS[["4. + geometry"]],
+  "4. + geometry",
+  verbose = FALSE
+)
+preds_s4 <- bind_rows(preds_s3, preds4)
+
+d4 <- bind_rows(
+  paired_delta(preds_s4, "3. + separation", "4. + geometry", "game_id"),
+  paired_delta(preds_s4, "3. + separation", "4. + geometry", "week"),
+  paired_delta(preds_s4, "2. play-by-play", "4. + geometry", "game_id"),
+  paired_delta(preds_s4, "cp", "4. + geometry", "game_id")
+)
+
+d4 |>
+  mutate(design_effect = (se_cluster / se_iid)^2) |>
+  select(reference, model, cluster, estimate, conf_low, conf_high, se_boot, design_effect) |>
+  gt() |>
+  tab_header(
+    title = "Paired differences in log loss (model minus reference)",
+    subtitle = "Cluster bootstrap, 10,000 draws, 95% percentile interval"
+  ) |>
+  fmt_number(columns = c(estimate, conf_low, conf_high), decimals = 4) |>
+  fmt_number(columns = se_boot, decimals = 5) |>
+  fmt_number(columns = design_effect, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+
+d43 <- d4[d4$reference == "3. + separation" & d4$cluster == "game_id", ]
+d42 <- d4[d4$reference == "2. play-by-play", ]
+d4cp <- d4[d4$reference == "cp", ]
+```
+
+**The rest of the coverage geometry improves on stage 3 by
+`r sprintf("%.4f", -d43$estimate)` nats**, 95% interval
+[`r sprintf("%.4f", -d43$conf_high)`, `r sprintf("%.4f", -d43$conf_low)`] by
+game. Together, stages 3 and 4 improve on stage 2 by
+`r sprintf("%.4f", -d42$estimate)` [`r sprintf("%.4f", -d42$conf_high)`,
+`r sprintf("%.4f", -d42$conf_low)`], against stage 2's
+`r sprintf("%.4f", -dg$estimate)` over the base rate, and stage 4 is
+`r sprintf("%.4f", -d4cp$estimate)` ahead of `cp`.
+
+The week-clustered interval is wider than the game-clustered one for this
+comparison (design effect
+`r sprintf("%.2f", (d4$se_cluster[2] / d4$se_iid[2])^2)` by week): the gain
+from the time-based features varies more from week to week than separation's
+did. It still excludes zero.
+
+## 10.4 By depth
+
+```{r}
+#| label: stage4-by-depth
+
+d4_depth <- preds_s4 |>
+  left_join(depth_of, by = c("game_id", "play_id")) |>
+  mutate(bucket = droplevels(depth_bucket(depth_arr))) |>
+  group_split(bucket) |>
+  map(\(d) {
+    paired_delta(d, "3. + separation", "4. + geometry", "game_id") |>
+      mutate(
+        bucket = as.character(d$bucket[1]),
+        stage3_log_loss = log_loss(
+          d$complete[d$model == "3. + separation"],
+          d$.pred[d$model == "3. + separation"]
+        )
+      )
+  }) |>
+  list_rbind()
+
+d4_depth |>
+  mutate(share_of_stage3 = -estimate / stage3_log_loss) |>
+  select(bucket, n, stage3_log_loss, estimate, conf_low, conf_high, share_of_stage3) |>
+  gt() |>
+  tab_header(
+    title = "Stage 4 minus stage 3, by depth (yd)",
+    subtitle = "Game-cluster bootstrap, 10,000 draws"
+  ) |>
+  fmt_number(columns = n, decimals = 0) |>
+  fmt_number(columns = c(stage3_log_loss, estimate, conf_low, conf_high), decimals = 4) |>
+  fmt_percent(columns = share_of_stage3, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+
+db4 <- function(b, col = "estimate") d4_depth[[col]][d4_depth$bucket == b]
+```
+
+**The geometry helps at every depth, most at intermediate depth**:
+`r sprintf("%.4f", -db4("0-10"))` nats on short throws,
+`r sprintf("%.4f", -db4("10-20"))` on intermediate ones, and
+`r sprintf("%.4f", -db4("20+"))` [`r sprintf("%.4f", -db4("20+", "conf_high"))`,
+`r sprintf("%.4f", -db4("20+", "conf_low"))`] on throws of 20+ yards. Relative to
+stage 3's loss the gain is largest at 10–20 yards, not on deep throws, where
+the time-based features had been expected to matter most. On deep throws
+stage 3's separation-by-depth interaction (§9.1) had already captured part of
+what the timing adds.
+
+## 10.5 Calibration
+
+```{r}
+#| label: stage4-calibration
+
+d_s4 <- filter(preds_s4, model == "4. + geometry") |>
+  left_join(depth_of, by = c("game_id", "play_id")) |>
+  mutate(bucket = droplevels(depth_bucket(depth_arr)))
+
+cal4 <- bind_rows(
+  calibration_summary(d_s4$complete, d_s4$.pred, d_s4$game_id) |>
+    mutate(bucket = "all"),
+  d_s4 |>
+    group_split(bucket) |>
+    map(\(d) {
+      calibration_summary(d$complete, d$.pred, d$game_id, B = 1000) |>
+        mutate(bucket = as.character(d$bucket[1]))
+    }) |>
+    list_rbind()
+)
+
+cal4 |>
+  filter(stat != "intercept") |>
+  mutate(value = sprintf("%.3f [%.3f, %.3f]", estimate, conf_low, conf_high)) |>
+  select(bucket, n, stat, value) |>
+  pivot_wider(names_from = stat, values_from = value) |>
+  gt() |>
+  tab_header(
+    title = "Stage 4 calibration",
+    subtitle = "Game-cluster bootstrap; 2,000 draws overall, 1,000 per bucket"
+  ) |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+
+c4 <- function(b, stat, col = "estimate") {
+  cal4[[col]][cal4$bucket == b & cal4$stat == stat]
+}
+```
+
+**Stage 4 is calibrated overall** — CITL
+`r sprintf("%.3f", round(c4("all", "citl"), 3) + 0)`
+[`r sprintf("%.3f", c4("all", "citl", "conf_low"))`,
+`r sprintf("%.3f", c4("all", "citl", "conf_high"))`], slope
+`r sprintf("%.3f", c4("all", "slope"))`
+[`r sprintf("%.3f", c4("all", "slope", "conf_low"))`,
+`r sprintf("%.3f", c4("all", "slope", "conf_high"))`] — and at short and
+intermediate depth. On deep throws the slope is
+`r sprintf("%.2f", c4("20+", "slope"))`
+[`r sprintf("%.2f", c4("20+", "slope", "conf_low"))`,
+`r sprintf("%.3f", c4("20+", "slope", "conf_high"))`]: its predictions are
+slightly too spread out there. This is reported rather than corrected. Stage 4
+is the last stage, so adjusting it to its own out-of-fold results would be
+tuning with nothing downstream to protect (`notes/decisions.md` §9.9).
+
+## 10.6 The money table
+
+```{r}
+#| label: money-table
+
+money <- preds_s4 |>
+  group_by(model) |>
+  summarize(n = n(), log_loss = log_loss(complete, .pred), .groups = "drop") |>
+  arrange(desc(log_loss)) |>
+  mutate(
+    vs_intercept = log_loss - log_loss[model == "1. intercept"],
+    vs_stage2 = log_loss - log_loss[model == "2. play-by-play"]
+  )
+
+money |>
+  gt() |>
+  tab_header(
+    title = "Out-of-fold log loss, stages 1-4 and cp",
+    subtitle = sprintf(
+      "%s throws beyond the line to a targeted receiver",
+      comma(nrow(mf_complete))
+    )
+  ) |>
+  fmt_number(columns = c(log_loss, vs_intercept, vs_stage2), decimals = 4) |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+The thesis is that tracking geometry adds information beyond play-by-play.
+Stage 2 sees what `cp` sees, in the same model class as stages 3 and 4, so the
+comparison that answers the question is stage 4 against stage 2: coverage
+geometry at the throw lowers out-of-fold log loss by
+`r sprintf("%.4f", -d42$estimate)` nats
+[`r sprintf("%.4f", -d42$conf_high)`, `r sprintf("%.4f", -d42$conf_low)`], more
+than the `r sprintf("%.4f", -dg$estimate)` that the play-by-play features gain
+over the base rate. Separation accounts for
+`r percent(d32$estimate / d42$estimate, accuracy = 1)` of that; leverage, time
+to arrival, and the passing window for the rest. `cp`, partly in-sample for
+2018 and with a more flexible model class, sits between stages 2 and 3.
+
+These numbers are provisional until `scripts/08_build_model_frame.R` builds the
+model frame; the inline assembly in §1 is what `08` will reproduce.

@@ -122,9 +122,17 @@ prepare_model_frame <- function(
 #' Stage 3 adds separation from the nearest defender and its rate of
 #' change, both at the throw frame (scripts/07_build_features.R), and a
 #' separation-by-depth interaction, because separation at the throw matters
-#' less on deep throws (notes/decisions.md §9.8). Stage 4
-#' (full geometry) is added once its feature columns exist. Fitted effects
-#' are reported in analysis/03_model_baseline.qmd.
+#' less on deep throws (notes/decisions.md §9.8).
+#'
+#' Stage 4 adds the nearest defender's leverage as a direction
+#' (`lev_angle`, a cyclic smooth on [-pi, pi]; its magnitude is already
+#' `sep_throw`), the nearest defender's time-to-arrival margin, and the
+#' passing-window margin of the best-placed other defender
+#' (notes/decisions.md §9.9). Fitted effects are reported in
+#' analysis/03_model_baseline.qmd.
+#'
+#' An entry may carry `knots`, passed to mgcv::gam(); the cyclic smooth
+#' needs its endpoints fixed at -pi and pi.
 MODEL_SPECS <- list(
   `1. intercept` = list(
     engine = "glm",
@@ -161,15 +169,38 @@ MODEL_SPECS <- list(
       s(sep_throw) +
       s(closing_throw) +
       ti(sep_throw, depth_arr)
+  ),
+
+  `4. + geometry` = list(
+    engine = "gam",
+    formula = complete ~
+      s(depth_arr) +
+      s(dist_to_sticks) +
+      s(los_x) +
+      s(number_of_pass_rushers, k = 5) +
+      s(depth_arr, by = qb_hit) +
+      down +
+      pass_location +
+      shotgun +
+      home +
+      s(sep_throw) +
+      s(closing_throw) +
+      ti(sep_throw, depth_arr) +
+      s(lev_angle, bs = "cc", k = 8) +
+      s(tta_nearest) +
+      s(window_margin),
+    knots = list(lev_angle = c(-pi, pi))
   )
 )
 
-# Stage 3 must be stage 2 plus separation terms, so the comparison is
-# nested.
-stopifnot(all(
-  attr(stats::terms(MODEL_SPECS[["2. play-by-play"]]$formula), "term.labels") %in%
-    attr(stats::terms(MODEL_SPECS[["3. + separation"]]$formula), "term.labels")
-))
+# Each stage must contain every term of the one before, so comparisons
+# are nested.
+local({
+  labels <- lapply(MODEL_SPECS, \(s) attr(stats::terms(s$formula), "term.labels"))
+  for (i in seq_along(labels)[-1]) {
+    stopifnot(all(labels[[i - 1]] %in% labels[[i]]))
+  }
+})
 
 
 # ---- the scoring population --------------------------------------
@@ -310,8 +341,8 @@ make_folds <- function(df, group = "week") {
 #' Fit one spec
 #'
 #' Binomial glm() or gam() according to `spec$engine`. GAMs use REML
-#' smoothness selection. `na.action = na.fail` so a fit never drops rows
-#' silently.
+#' smoothness selection and the spec's `knots`, if any. `na.action =
+#' na.fail` so a fit never drops rows silently.
 #'
 #' @param spec One entry of MODEL_SPECS.
 #' @param data Training rows.
@@ -331,6 +362,7 @@ fit_one <- function(spec, data) {
       data = data,
       family = stats::binomial(),
       method = "REML",
+      knots = spec$knots,
       na.action = stats::na.fail
     )
   }

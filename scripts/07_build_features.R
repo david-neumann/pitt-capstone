@@ -8,10 +8,28 @@
 #   closing_throw  rate of change of that distance at the throw frame,
 #                  yd/s; negative when the defender is closing
 #
+# Stage 4 (geometry), on the lane from the ball at the throw to the arrival
+# point (arrival.parquet):
+#   lev_angle      direction of the nearest defender from the receiver in
+#                  lane coordinates, radians: 0 over the top, +-pi
+#                  underneath, +pi/2 inside, -pi/2 outside. A direction
+#                  only, because sep_throw is its magnitude and l_par,
+#                  l_perp, and sep together are redundant.
+#   tta_nearest    ball flight time minus the nearest defender's time to
+#                  the arrival point, seconds; positive when the defender
+#                  can get there first
+#   window_margin  over defenders other than the nearest, the largest
+#                  max_u [u T - tau_j(u)]: how far ahead of the ball the
+#                  best-placed help defender can reach any point u of the
+#                  lane, seconds (notes/decisions.md §7)
+#   window_n_pos   number of those defenders with a positive margin;
+#                  descriptive only
+#
 # The nearest defender is determined at the throw frame. Ties go to the
 # lower nfl_id and are counted in `nearest_tied`. Missing `dir` propagates
-# to NA in `closing_throw` rather than being imputed; the model frame
-# decides what to do with those plays.
+# to NA rather than being imputed, as does `lev_angle` on the few plays
+# where the ball did not move between the throw and arrival frames (no
+# lane); the model frame decides what to do with those plays.
 #
 # Records measured facts only and drops no plays. No outcome columns.
 #
@@ -34,6 +52,10 @@ processed <- here("data", "processed")
 throw_frame <- read_parquet(path(processed, "throw_frame.parquet")) |>
   filter(anchor == "throw", !is_ball)
 arrival <- read_parquet(path(processed, "arrival.parquet"))
+
+# Lane positions at which each help defender is timed against the ball,
+# which is assumed to travel the lane at constant speed.
+WINDOW_U <- seq(0, 1, by = 0.05)
 
 target <- throw_frame |>
   filter(is_target) |>
@@ -88,6 +110,72 @@ features <- nearest |>
     closing_throw
   )
 
+# ---- stage 4: leverage, time to arrival, passing window -----------------
+
+lane <- arrival |>
+  select(game_id, play_id, x_throw, y_throw, x_arr, y_arr, t_flight)
+
+nearest_geo <- nearest |>
+  select(game_id, play_id, def_nfl_id, xr, yr, xd, yd, sd, dird) |>
+  inner_join(lane, by = c("game_id", "play_id"))
+
+lev <- rotate_to_lane(
+  nearest_geo$x_throw,
+  nearest_geo$y_throw,
+  nearest_geo$x_arr,
+  nearest_geo$y_arr,
+  nearest_geo$xd,
+  nearest_geo$yd,
+  nearest_geo$xr,
+  nearest_geo$yr
+)
+v_n <- velocity_xy(nearest_geo$sd, nearest_geo$dird)
+
+stage4_nearest <- nearest_geo |>
+  mutate(
+    l_par = lev$l_par,
+    l_io = to_inside_outside(lev$l_perp, yr),
+    lev_angle = atan2(l_io, l_par),
+    tta_nearest = t_flight -
+      time_to_point(xd, yd, v_n$vx, v_n$vy, x_arr, y_arr)
+  ) |>
+  select(game_id, play_id, l_par, l_io, lev_angle, tta_nearest)
+
+# Help defenders: every defender except the nearest, timed to each lane
+# position.
+help <- defenders |>
+  anti_join(
+    select(nearest, game_id, play_id, def_nfl_id),
+    by = c("game_id", "play_id", "def_nfl_id")
+  ) |>
+  inner_join(lane, by = c("game_id", "play_id"))
+
+v_h <- velocity_xy(help$sd, help$dird)
+help <- mutate(help, vxd = v_h$vx, vyd = v_h$vy)
+
+margins <- tidyr::crossing(help, u = WINDOW_U) |>
+  mutate(
+    px = x_throw + u * (x_arr - x_throw),
+    py = y_throw + u * (y_arr - y_throw),
+    margin = u * t_flight - time_to_point(xd, yd, vxd, vyd, px, py)
+  ) |>
+  group_by(game_id, play_id, def_nfl_id) |>
+  # NA when the defender's direction is missing, so it is not silently
+  # ignored in the play-level maximum below.
+  summarize(margin = max(margin), .groups = "drop")
+
+window <- margins |>
+  group_by(game_id, play_id) |>
+  summarize(
+    window_margin = max(margin),
+    window_n_pos = sum(margin > 0),
+    .groups = "drop"
+  )
+
+features <- features |>
+  left_join(stage4_nearest, by = c("game_id", "play_id")) |>
+  left_join(window, by = c("game_id", "play_id"))
+
 # Every play with an arrival has a target and at least one defender.
 features <- arrival |>
   select(game_id, play_id) |>
@@ -99,7 +187,22 @@ stopifnot(
   !any(duplicated(features[c("game_id", "play_id")])),
   !anyNA(features$sep_throw),
   all(features$sep_throw >= 0),
-  all(features$n_defenders >= 1)
+  all(features$n_defenders >= 2),
+  # Leverage is undefined only where the ball did not move between the
+  # throw and arrival frames.
+  identical(
+    is.na(features$lev_angle),
+    arrival$lane_len[match(
+      paste(features$game_id, features$play_id),
+      paste(arrival$game_id, arrival$play_id)
+    )] == 0
+  ),
+  all(abs(features$lev_angle) <= pi, na.rm = TRUE),
+  # The direction and magnitude reproduce the lane offsets.
+  with(
+    filter(features, !is.na(l_par)),
+    isTRUE(all.equal(l_par^2 + l_io^2, sep_throw^2))
+  )
 )
 
 write_parquet(features, path(processed, "features.parquet"))
@@ -111,5 +214,11 @@ message(
   sum(features$nearest_tied),
   " nearest-defender ties; ",
   sum(is.na(features$closing_throw)),
-  " plays with closing_throw NA (missing dir)."
+  " with closing_throw NA, ",
+  sum(is.na(features$tta_nearest)),
+  " with tta_nearest NA, ",
+  sum(is.na(features$window_margin)),
+  " with window_margin NA (missing dir); ",
+  sum(is.na(features$lev_angle)),
+  " with lev_angle NA (zero-length lane)."
 )
