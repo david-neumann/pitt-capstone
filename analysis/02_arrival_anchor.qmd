@@ -835,7 +835,7 @@ median shift zero — against 0.38 for the $\epsilon$ check in §5.1. That is th
 difference between separating two regimes and picking a point on a continuum.
 
 Now the gap tolerance. `flight_end_index()` merges flight-speed runs separated
-by fewer than `ARRIVAL_GAP_TOL` frames. The two extremes are both wrong:
+by at most `ARRIVAL_GAP_TOL` frames. The two extremes are both wrong:
 tolerance 0 lets one frame of jitter on a wobbling ball end the flight early,
 while an unbounded tolerance lets a jittery frame during a catch-and-run be
 selected as the flight end.
@@ -1081,7 +1081,8 @@ the selection on outcome that §1 rejected.
 
 :::
 
-**Full-season checks to re-run once `06` exists**, before any feature work:
+**Full-season checks**, run in `analysis/04_arrival_season.qmd` once `06`
+existed; all pass (`notes/decisions.md` §6.9):
 
 1. §7.1 class similarity, all 17 weeks. The week-1 numbers are the benchmark.
 2. §7.3 speed equalization, all 17 weeks. The result the definition rests on.
@@ -1091,6 +1092,6 @@ the selection on outcome that §1 rejected.
    where the number says it is. A sign error or an off-by-one is invisible in a
    summary table and obvious in an animation.
 
-**Still open** (`notes/decisions.md` §7): whether `keep_arrival` survives as a
-flag now that arrival is derived rather than read, the beyond-the-LOS
-threshold, corridor width, and `qb_hit` as filter or covariate.
+**Since resolved** (`notes/decisions.md` §4.8, §7): `keep_arrival` is a
+diagnostic only, the beyond-the-LOS threshold is $\text{depth}_{\text{arr}} > 0$,
+and `qb_hit` is a covariate. Corridor width remains open.

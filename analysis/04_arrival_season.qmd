@@ -1,0 +1,773 @@
+---
+title: "The arrival anchor at season scale"
+subtitle: "STAT 1961 Capstone — validation of scripts/06_build_throw_frame.R"
+author: "David Neumann"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: [brite, ../theme/capstone.scss]
+    code-summary: "Show code"
+    fig-width: 8
+    fig-height: 5
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 0. Setup
+
+```{r}
+#| label: setup
+#| include: false
+if (Sys.getenv("RENV_PROJECT") == "") {
+  root <- normalizePath("..", mustWork = TRUE)
+  Sys.setenv(RENV_PROJECT = root)
+  setwd(root)
+  source("renv/activate.R")
+}
+
+library(tidyverse)
+library(arrow)
+library(here)
+library(gt)
+library(gtExtras)
+library(scales)
+library(patchwork)
+
+source(here("R", "constants.R"))
+source(here("R", "utils.R"))
+source(here("R", "arrival.R"))
+source(here("R", "viz.R"))
+
+fig_dir <- here("figs", "week06")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 0.1 What this notebook is
+
+`analysis/02_arrival_anchor.qmd` defined the arrival anchor on week 1 and
+listed the checks to repeat on the full season (`notes/decisions.md` §6.8).
+`scripts/06_build_throw_frame.R` now applies `detect_arrival()` to every play
+with a tracked target. This notebook runs those checks on its output:
+
+1. class similarity of $d_{\text{arr}}$;
+2. speed equalization by lane length;
+3. the bounce check;
+4. three plays drawn frame by frame around arrival;
+5. external validation of the tracking-derived depth against nflverse
+   `air_yards`, which also informs the beyond-the-line-of-scrimmage threshold.
+
+It also reruns the $\delta$ and gap-tolerance sensitivity checks at season
+scale. It reads persisted artifacts and writes nothing to `data/`.
+
+```{r}
+#| label: load_data
+
+arrival <- read_parquet(here("data", "processed", "arrival.parquet"))
+approach <- read_parquet(here("data", "processed", "approach.parquet"))
+analytic_sample <- read_parquet(here(
+  "data",
+  "processed",
+  "analytic_sample.parquet"
+))
+pbp <- read_parquet(here("data", "processed", "pbp.parquet"))
+trk <- open_dataset(here("data", "processed", "tracking"))
+
+# arrival.parquet carries no outcome columns; pass_result is joined here.
+arr <- arrival |>
+  left_join(
+    select(analytic_sample, game_id, play_id, pass_result, throw_anchor),
+    by = c("game_id", "play_id")
+  )
+```
+
+# 1. Coverage
+
+```{r}
+#| label: coverage
+
+targets <- filter(analytic_sample, target_tracked)
+no_arrival <- anti_join(targets, arrival, by = c("game_id", "play_id"))
+
+tibble(
+  quantity = c(
+    "plays in analytic_sample",
+    "with a tracked target",
+    "with an arrival",
+    "without an approach series",
+    "closest-approach fallback (used_fallback)",
+    "closest approach at the last searched frame (at_window_edge)",
+    "arrival at the window cap (5.0 s)"
+  ),
+  n = c(
+    nrow(analytic_sample),
+    nrow(targets),
+    nrow(arrival),
+    nrow(no_arrival),
+    sum(arrival$used_fallback),
+    sum(arrival$at_window_edge),
+    sum(arrival$f_arr == arrival$f_throw + MAX_FLIGHT_FRAMES)
+  )
+) |>
+  mutate(
+    pct_of_tracked_target = if_else(
+      row_number() == 1,
+      NA_real_,
+      n / nrow(targets)
+    )
+  ) |>
+  gt() |>
+  fmt_number(columns = n, decimals = 0) |>
+  fmt_percent(columns = pct_of_tracked_target, decimals = 2) |>
+  sub_missing(missing_text = "") |>
+  gt_theme_538(quiet = TRUE)
+
+no_arrival |>
+  select(game_id, play_id, week, pass_result, throw_anchor, f_throw, last_frame) |>
+  gt() |>
+  tab_header(title = "Plays with a tracked target but no approach series") |>
+  gt_theme_538(quiet = TRUE)
+```
+
+The plays without an approach series have no frame after the throw on which
+both the ball and the targeted receiver are tracked: in one, tracking ends at
+the throw frame; in the other two, the targeted receiver appears only on the
+first two frames of the play. `target_tracked` records that the target appears
+in the tracking data at all, not that they are tracked at the throw.
+
+`at_window_edge` is common on completions and is not a failure: after a catch
+the ball stays in the receiver's hands, so the distance can keep shrinking to
+the last frame searched. It marks where the *closest approach* fell, not the
+arrival frame, which is found before it.
+
+# 2. Week 1 reproduces the prototype
+
+The week-1 subset of `arrival.parquet` should match `02_arrival_anchor.qmd`
+§7.1 exactly: 890 plays, and the same medians.
+
+```{r}
+#| label: week1-reproduction
+
+arr |>
+  filter(week == 1) |>
+  group_by(pass_result) |>
+  summarize(
+    plays = n(),
+    p50_d_arr = median(d_arr),
+    p50_d_min = median(d_min),
+    p50_to_min = median(frames_to_min),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  tab_header(title = "Week 1, from scripts/06_build_throw_frame.R") |>
+  fmt_number(columns = starts_with("p50_d"), decimals = 3) |>
+  fmt_number(columns = p50_to_min, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+`r sum(arr$week == 1)` plays, with medians matching the prototype's rendered
+table (completion $d_{\text{arr}}$ 0.70, incompletion 1.16, completion
+$d_{\min}$ 0.12).
+
+# 3. Class similarity
+
+```{r}
+#| label: class-similarity
+
+class_sim <- arr |>
+  group_by(pass_result) |>
+  summarize(
+    plays = n(),
+    p50_d_arr = median(d_arr),
+    p90_d_arr = quantile(d_arr, 0.90),
+    p50_d_min = median(d_min),
+    p50_to_min = median(frames_to_min),
+    fallback = mean(used_fallback),
+    .groups = "drop"
+  )
+
+class_sim |>
+  gt() |>
+  tab_header(title = "All 17 weeks") |>
+  fmt_number(columns = c(p50_d_arr, p90_d_arr, p50_d_min), decimals = 2) |>
+  fmt_number(columns = p50_to_min, decimals = 1) |>
+  fmt_percent(columns = fallback, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+
+cls <- function(r, col) class_sim[[col]][class_sim$pass_result == r]
+```
+
+The season-scale medians stay close to week 1: $d_{\text{arr}}$ of
+`r sprintf("%.2f", cls("C", "p50_d_arr"))` yd on completions and
+`r sprintf("%.2f", cls("I", "p50_d_arr"))` on incompletions, against 0.70 and
+1.16. As in the prototype, the residual difference is a football fact — a
+caught ball ends up closer to the receiver than a dropped one — and the target
+is similarity, not zero. Median $d_{\min}$ on completions,
+`r sprintf("%.2f", cls("C", "p50_d_min"))` yd, confirms that the distance
+series is right. The fallback rate is similar across classes.
+
+# 4. Flight time
+
+```{r}
+#| label: flight-time
+
+arr |>
+  summarize(
+    p01 = quantile(t_flight, 0.01),
+    p50 = median(t_flight),
+    p99 = quantile(t_flight, 0.99),
+    max = max(t_flight),
+    `under 0.4 s` = sum(t_flight < 0.4)
+  ) |>
+  pivot_longer(everything(), names_to = "statistic") |>
+  gt() |>
+  fmt_number(columns = value, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+
+short <- filter(arr, t_flight < 0.4)
+```
+
+p99 of `r sprintf("%.1f", quantile(arr$t_flight, 0.99))` s supports the 5.0 s
+window. Flights under 0.4 s number `r comma(nrow(short))`; their median depth
+is `r sprintf("%.1f", median(short$depth_arr))` yd, so they are mostly throws
+at or behind the line — shovels, screens, batted balls — that the
+beyond-the-line filter removes.
+
+# 5. Speed equalization
+
+The decisive check. An artifact in arrival *timing* would show up as an
+outcome-dependent implied ball speed, lane length divided by flight time,
+within bins of lane length.
+
+```{r}
+#| label: speed-equalization
+
+speed <- arr |>
+  filter(pass_result %in% c("C", "I"), between(lane_len, 8, 30)) |>
+  mutate(
+    v_ball = lane_len / t_flight,
+    bin = cut(lane_len, seq(8, 30, by = 2))
+  ) |>
+  group_by(bin, pass_result) |>
+  summarize(
+    n = n(),
+    p50_lane = median(lane_len),
+    p50_v = median(v_ball),
+    .groups = "drop"
+  )
+
+speed_wide <- speed |>
+  pivot_wider(names_from = pass_result, values_from = c(n, p50_lane, p50_v)) |>
+  mutate(diff_v = p50_v_C - p50_v_I)
+
+speed_wide |>
+  gt() |>
+  tab_header(title = "Median implied ball speed (yd/s) by lane length (yd)") |>
+  fmt_number(columns = c(starts_with("p50"), diff_v), decimals = 2) |>
+  fmt_number(columns = starts_with("n_"), decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+
+p_speed <- speed |>
+  ggplot(aes(p50_lane, p50_v, colour = pass_result)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(
+    title = "Implied ball speed by lane length, all 17 weeks",
+    subtitle = "Median within 2-yard bins of lane length",
+    x = "lane length (yd)",
+    y = "implied ball speed (yd/s)",
+    colour = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave(
+  here("figs", "week06", "arrival_speed_equalization.png"),
+  p_speed,
+  width = 7,
+  height = 4,
+  dpi = 200
+)
+
+p_speed
+```
+
+**Completions and incompletions agree within
+`r sprintf("%.2f", max(abs(speed_wide$diff_v)))` yd/s in every bin**, against
+about 1 yd/s on week 1. This is the result the definition rests on: the anchor
+does not time completions and incompletions differently.
+
+The season-scale curve is not flat across depth, as week 1 suggested. Implied
+speed rises from about `r sprintf("%.0f", speed_wide$p50_v_C[1])` yd/s on
+8–10 yd lanes to about `r sprintf("%.0f", max(speed_wide$p50_v_C))` yd/s
+beyond 18 yd, then levels off. Both classes trace the same curve, so it is not
+an outcome artifact. Two explanations fit, and the data here cannot separate
+them: short passes are thrown with more touch, and any fixed offset in the
+`pass_forward` frame inflates flight time proportionally more on short lanes.
+
+# 6. Bounce check
+
+```{r}
+#| label: bounce-check
+
+bounce <- approach |>
+  inner_join(
+    select(arrival, game_id, play_id, f_arr, f_min),
+    by = c("game_id", "play_id")
+  ) |>
+  filter(frame_id >= f_arr, frame_id <= f_min) |>
+  group_by(game_id, play_id) |>
+  summarize(max_rise = max(d) - first(d), .groups = "drop")
+
+bounce |>
+  summarize(
+    plays = n(),
+    `rise > 1 yd` = sum(max_rise > 1),
+    `rise > 3 yd` = sum(max_rise > 3),
+    p99_rise = quantile(max_rise, 0.99)
+  ) |>
+  pivot_longer(everything(), names_to = "statistic") |>
+  gt() |>
+  fmt_number(columns = value, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+`r sum(bounce$max_rise > 1)` plays of `r comma(nrow(bounce))`
+(`r percent(mean(bounce$max_rise > 1), accuracy = 0.01)`) show more than a
+yard of rise between the arrival frame and closest approach, against 6 of 890
+on week 1, and p99 is
+`r sprintf("%.2f", quantile(bounce$max_rise, 0.99))` yd. No rarer artifact
+appears at 17 times the sample.
+
+# 7. Sensitivity at season scale
+
+`approach.parquet` holds the full search window, so the anchor can be
+recomputed under other parameter values without rescanning tracking.
+
+```{r}
+#| label: sensitivity
+
+base <- select(arrival, game_id, play_id, f_base = f_arr)
+
+agree <- function(...) {
+  detect_arrival(approach, ...) |>
+    select(game_id, play_id, f_arr) |>
+    inner_join(base, by = c("game_id", "play_id")) |>
+    summarize(
+      agreement = mean(f_arr == f_base),
+      median_shift = median(f_arr - f_base)
+    )
+}
+
+stopifnot(identical(
+  detect_arrival(approach) |>
+    arrange(game_id, play_id) |>
+    pull(f_arr),
+  arrange(arrival, game_id, play_id)$f_arr
+))
+
+sens <- bind_rows(
+  agree(dis_flight = 1.0) |> mutate(parameter = "delta = 1.0"),
+  agree(dis_flight = 1.6) |> mutate(parameter = "delta = 1.6"),
+  agree(gap_tol = 0L) |> mutate(parameter = "gap_tol = 0"),
+  agree(gap_tol = 1L) |> mutate(parameter = "gap_tol = 1"),
+  agree(gap_tol = 3L) |> mutate(parameter = "gap_tol = 3"),
+  agree(gap_tol = 5L) |> mutate(parameter = "gap_tol = 5")
+) |>
+  relocate(parameter)
+
+sens |>
+  gt() |>
+  tab_header(
+    title = "Agreement with the adopted anchor (delta = 1.3, gap_tol = 2)"
+  ) |>
+  fmt_number(columns = agreement, decimals = 3) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+The adopted parameters reproduce `arrival.parquet` exactly (asserted). Frame
+agreement stays high across a near two-fold range of $\delta$ with a median
+shift of zero, as on week 1, and the gap tolerance only matters between 0 and
+1.
+
+# 8. Visual check
+
+One completion, one incompletion, and one interception, drawn at random among
+plays 10–25 yd deep that did not use the fallback. Each row shows four frames
+around arrival. The dashed line is the lane from the ball at the throw to the
+arrival point (×); the targeted receiver is ringed in gold; the ball is the
+small brown point. At $f_{\text{arr}}$ the ball should be at the ×, close to
+the target, and moving toward the target in the frames before.
+
+```{r}
+#| label: visual-check
+#| fig-height: 9
+
+set.seed(1961)
+picks <- arr |>
+  filter(
+    pass_result %in% c("C", "I", "IN"),
+    !used_fallback,
+    between(depth_arr, 10, 25)
+  ) |>
+  group_by(pass_result) |>
+  slice_sample(n = 1) |>
+  ungroup()
+
+rel_frames <- c(-4L, -2L, 0L, 2L)
+
+frame_strip <- function(a1) {
+  frames <- a1$f_arr + rel_frames
+  rows <- trk |>
+    filter(
+      game_id == a1$game_id,
+      play_id == a1$play_id,
+      frame_id %in% frames
+    ) |>
+    select(frame_id, nfl_id, side, is_ball, x, y) |>
+    collect() |>
+    cast_keys() |>
+    mutate(
+      rel = factor(
+        frame_id - a1$f_arr,
+        levels = rel_frames,
+        labels = c("f_arr - 4", "f_arr - 2", "f_arr", "f_arr + 2")
+      ),
+      is_target = !is_ball & nfl_id == a1$target_nfl_id
+    )
+
+  xr <- range(c(rows$x, a1$x_throw, a1$x_arr, a1$los_x), na.rm = TRUE)
+  xlim <- c(max(0, xr[1] - 4), min(FIELD_LENGTH, xr[2] + 4))
+
+  gg_field(los_x = a1$los_x, xlim = xlim) +
+    geom_segment(
+      data = a1,
+      aes(x = x_throw, y = y_throw, xend = x_arr, yend = y_arr),
+      linetype = "dashed",
+      colour = "white"
+    ) +
+    geom_point(
+      data = filter(rows, !is_ball),
+      aes(x, y, fill = side),
+      shape = 21,
+      size = 2.4,
+      colour = "grey15"
+    ) +
+    geom_point(
+      data = filter(rows, is_target),
+      aes(x, y),
+      shape = 21,
+      size = 4.8,
+      colour = "#f5c518",
+      stroke = 1.2
+    ) +
+    geom_point(
+      data = a1,
+      aes(x_arr, y_arr),
+      shape = 4,
+      size = 3,
+      colour = "white",
+      stroke = 1.1
+    ) +
+    geom_point(
+      data = filter(rows, is_ball),
+      aes(x, y),
+      shape = 21,
+      size = 1.8,
+      fill = "#7a4a1f",
+      colour = "white"
+    ) +
+    scale_fill_manual(values = c(offense = "#1f4fd8", defense = "#d62728")) +
+    facet_wrap(~rel, nrow = 1) +
+    labs(
+      title = sprintf(
+        "%s — game %s, play %s: d_arr %.2f yd, depth %.1f yd, flight %.1f s",
+        a1$pass_result,
+        a1$game_id,
+        a1$play_id,
+        a1$d_arr,
+        a1$depth_arr,
+        a1$t_flight
+      ),
+      fill = NULL
+    ) +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 9),
+      strip.text = element_text(size = 8)
+    )
+}
+
+p_visual <- wrap_plots(
+  map(split(picks, seq_len(nrow(picks))), frame_strip),
+  ncol = 1
+)
+
+ggsave(
+  here("figs", "week06", "arrival_frames.png"),
+  p_visual,
+  width = 10,
+  height = 9,
+  dpi = 200
+)
+
+p_visual
+```
+
+## 8.1 Animations
+
+The same three plays animated with `render_play()` from the snap to 10 frames
+after arrival, one animation frame per tracking frame. Offense is blue, defense
+red. GIFs are written to `figs/week06/` and are not committed (`*.gif` is
+ignored); they are embedded in the rendered notebook.
+
+```{r}
+#| label: animations
+#| results: asis
+
+plays_meta <- read_parquet(here("data", "processed", "plays.parquet")) |>
+  select(game_id, play_id, yards_to_go, play_description)
+
+gif_paths <- map_chr(seq_len(nrow(picks)), \(i) {
+  a1 <- picks[i, ]
+  f_snap <- analytic_sample$f_ball_snap[
+    analytic_sample$game_id == a1$game_id &
+      analytic_sample$play_id == a1$play_id
+  ]
+
+  play_trk <- trk |>
+    filter(
+      game_id == a1$game_id,
+      play_id == a1$play_id,
+      frame_id >= f_snap,
+      frame_id <= a1$f_arr + 10L
+    ) |>
+    collect() |>
+    cast_keys() |>
+    arrange(frame_id)
+
+  teams <- play_trk |>
+    filter(!is_ball) |>
+    distinct(team_abbr, side)
+  pal <- setNames(
+    if_else(teams$side == "offense", "#1f4fd8", "#d62728"),
+    teams$team_abbr
+  )
+
+  this_play <- a1 |>
+    select(game_id, play_id, los_x) |>
+    left_join(plays_meta, by = c("game_id", "play_id"))
+
+  path <- here(
+    "figs",
+    "week06",
+    sprintf("arrival_%s_%s_%s.gif", a1$pass_result, a1$game_id, a1$play_id)
+  )
+  render_play(play_trk, this_play, path, width = 800, height = 450, pal = pal)
+  path
+})
+
+# Relative to this notebook, so the HTML can embed them.
+for (g in gif_paths) {
+  cat(sprintf("![](%s)\n\n", file.path("..", "figs", "week06", basename(g))))
+}
+```
+
+# 9. External validation against `air_yards`
+
+nflverse `air_yards` is charted by hand: the distance downfield from the line
+of scrimmage to where the pass is caught or targeted. The tracking-derived
+depth is
+$\text{depth}_{\text{arr}} = x_{\text{arr}} - x_{\text{LOS}}$ in standardized
+coordinates. The two are independent measurements of the same quantity, so
+their agreement checks the anchor, the sign convention, and the line of
+scrimmage at once.
+
+```{r}
+#| label: air-yards-join
+
+av <- arr |>
+  filter(pass_result %in% c("C", "I", "IN")) |>
+  inner_join(
+    select(pbp, game_id, play_id, air_yards) |> filter(!is.na(air_yards)),
+    by = c("game_id", "play_id")
+  ) |>
+  mutate(diff = depth_arr - air_yards)
+
+tibble(
+  quantity = c(
+    "plays compared",
+    "correlation",
+    "median depth_arr - air_yards (yd)",
+    "IQR of the difference (yd)",
+    "mean absolute difference (yd)"
+  ),
+  value = c(
+    comma(nrow(av)),
+    sprintf("%.3f", cor(av$depth_arr, av$air_yards)),
+    sprintf("%.2f", median(av$diff)),
+    sprintf(
+      "[%.2f, %.2f]",
+      quantile(av$diff, 0.25),
+      quantile(av$diff, 0.75)
+    ),
+    sprintf("%.2f", mean(abs(av$diff)))
+  )
+) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+
+av |>
+  group_by(pass_result) |>
+  summarize(
+    plays = n(),
+    correlation = cor(depth_arr, air_yards),
+    p10_diff = quantile(diff, 0.10),
+    p50_diff = median(diff),
+    p90_diff = quantile(diff, 0.90),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  tab_header(title = "depth_arr - air_yards by outcome") |>
+  fmt_number(columns = -c(pass_result, plays), decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: air-yards-plot
+#| fig-height: 5.5
+
+p_air <- av |>
+  ggplot(aes(air_yards, depth_arr)) +
+  geom_point(alpha = 0.06, size = 0.6) +
+  geom_abline(colour = "#1f4fd8", linewidth = 0.5) +
+  geom_hline(yintercept = 0, linewidth = 0.3, colour = "grey40") +
+  geom_vline(xintercept = 0, linewidth = 0.3, colour = "grey40") +
+  coord_equal() +
+  labs(
+    title = "Tracking-derived depth against charted air yards",
+    subtitle = "Blue line: equality",
+    x = "nflverse air_yards",
+    y = "depth_arr = x_arr - LOS (yd)"
+  ) +
+  theme_minimal()
+
+ggsave(
+  here("figs", "week06", "depth_vs_air_yards.png"),
+  p_air,
+  width = 6,
+  height = 6,
+  dpi = 200
+)
+
+p_air
+```
+
+```{r}
+#| label: air-yards-by-band
+
+av |>
+  mutate(
+    air_yards_band = cut(
+      air_yards,
+      c(-Inf, -5, -1, 0, 4, 9, 19, Inf),
+      labels = c("<= -5", "-4 to -1", "0", "1-4", "5-9", "10-19", "20+")
+    )
+  ) |>
+  group_by(air_yards_band) |>
+  summarize(
+    plays = n(),
+    p10_depth = quantile(depth_arr, 0.10),
+    p50_depth = median(depth_arr),
+    p90_depth = quantile(depth_arr, 0.90),
+    mean_diff = mean(diff),
+    .groups = "drop"
+  ) |>
+  gt() |>
+  tab_header(title = "depth_arr within bands of charted air yards") |>
+  fmt_number(columns = -c(air_yards_band, plays), decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+
+zero <- filter(av, air_yards == 0)
+by_class <- av |>
+  group_by(pass_result) |>
+  summarize(m = median(diff))
+```
+
+**The two measurements agree closely and the sign convention is right**: the
+correlation is `r sprintf("%.3f", cor(av$depth_arr, av$air_yards))`, and the
+median difference is `r sprintf("%.2f", median(av$diff))` yd. The tracking
+depth runs slightly short of the charted value, as it should: the anchor is the
+last frame the ball is still in flight, about a frame before the ball reaches
+the receiver, while charting records the catch point. The shortfall grows on
+deep throws, where the ball covers about 2 yd per frame.
+
+**The offset does not depend on the outcome**: the median difference is
+`r sprintf("%.2f", by_class$m[by_class$pass_result == "C"])` yd on completions
+and `r sprintf("%.2f", by_class$m[by_class$pass_result == "I"])` on
+incompletions. The spread is wider on incompletions, where the charter records
+an intended spot rather than a catch.
+
+**Charted zero is mostly just behind the line.** The
+`r comma(nrow(zero))` throws charted at exactly zero air yards have a median
+tracking depth of `r sprintf("%.2f", median(zero$depth_arr))` yd, and
+`r percent(mean(zero$depth_arr <= 0), accuracy = 1)` of them arrive at or
+behind the line by tracking. Zero is a charting convention for throws at the
+line, which is why the threshold is set on the tracking depth.
+
+## 9.1 The beyond-the-line-of-scrimmage threshold
+
+```{r}
+#| label: threshold-candidates
+
+thresholds <- c(0, 0.5, 1, 2)
+
+map(thresholds, \(th) {
+  keep <- av$depth_arr > th
+  tibble(
+    rule = sprintf("depth_arr > %.1f", th),
+    kept = sum(keep),
+    pct_kept = mean(keep),
+    `kept, charted <= 0` = sum(keep & av$air_yards <= 0),
+    `dropped, charted > 0` = sum(!keep & av$air_yards > 0),
+    complete_kept = mean(av$pass_result[keep] == "C"),
+    complete_dropped = mean(av$pass_result[!keep] == "C")
+  )
+}) |>
+  list_rbind() |>
+  bind_rows(tibble(
+    rule = "air_yards > 0 (charted)",
+    kept = sum(av$air_yards > 0),
+    pct_kept = mean(av$air_yards > 0),
+    complete_kept = mean(av$pass_result[av$air_yards > 0] == "C"),
+    complete_dropped = mean(av$pass_result[av$air_yards <= 0] == "C")
+  )) |>
+  gt() |>
+  tab_header(title = "Candidate beyond-the-line rules") |>
+  fmt_number(columns = c(kept, starts_with("kept,"), starts_with("dropped,")), decimals = 0) |>
+  fmt_percent(columns = c(pct_kept, complete_kept, complete_dropped), decimals = 1) |>
+  sub_missing(missing_text = "") |>
+  gt_theme_538(quiet = TRUE)
+
+at0 <- av$depth_arr > 0
+```
+
+The adopted rule is **$\text{depth}_{\text{arr}} > 0$**: the ball arrives
+beyond the line of scrimmage. It keeps `r comma(sum(at0))` throws
+(`r percent(mean(at0), accuracy = 0.1)`), within
+`r abs(sum(at0) - sum(av$air_yards > 0))` of the charted rule, and the two
+disagree on
+`r comma(sum(at0 != (av$air_yards > 0)))` throws
+(`r percent(mean(at0 != (av$air_yards > 0)), accuracy = 0.1)`):
+`r sum(at0 & av$air_yards <= 0)` kept although charted at or behind the line,
+and `r sum(!at0 & av$air_yards > 0)` dropped although charted beyond it. Raising the threshold mostly drops throws that were
+charted beyond the line. The excluded throws complete at
+`r percent(mean(av$pass_result[!at0] == "C"), accuracy = 0.1)`, against
+`r percent(mean(av$pass_result[at0] == "C"), accuracy = 0.1)` for those kept:
+screens and other throws at the line are easy completions, so this is a
+population definition, stated with its composition, not ignorable attrition.
+The threshold is recorded in `notes/decisions.md` §7.

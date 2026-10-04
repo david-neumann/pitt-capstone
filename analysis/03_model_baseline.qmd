@@ -70,10 +70,11 @@ are not yet reproducible from a build artifact.
 
 **One of the question's population filters is applied, inline in §1.2**: a
 targeted receiver (`notes/decisions.md` §4.9). Spikes and scrambles are already
-absent from the analytic sample. The beyond-the-line-of-scrimmage filter is
-**not** applied, because its threshold waits on the tracking-derived throw
-distance from `06`. It will remove roughly a fifth of these plays
-(`notes/decisions.md` §7), which changes every number below. Stage 3 and 4
+absent from the analytic sample. The beyond-the-line-of-scrimmage filter
+($\text{depth}_{\text{arr}} > 0$, `notes/decisions.md` §7) is **not yet**
+applied; it arrives with the tracking-derived depth when `08` assembles the
+model frame. It will remove roughly a fifth of these plays, which changes every
+number below. Stage 3 and 4
 features do not exist yet either, so what follows is the **floor and the
 baseline**, plus the external benchmark. The thesis is untested.
 

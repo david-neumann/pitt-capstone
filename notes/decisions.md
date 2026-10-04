@@ -31,7 +31,7 @@ written as a side effect of rendering `analysis/01_eda.qmd`.
 | `03_build_play_index.R` | built | Measured facts, one row per play and per player-play. No decisions. |
 | `04_build_sample.R` | built | Base sample exclusions, via `R/sample_rules.R`. |
 | `05_join_pbp.R` | built | Pulls and mirrors nflverse play-by-play; emits `pbp.parquet` on the plays keys. Measured facts only. |
-| `06_build_throw_frame.R` | planned | Applies `R/arrival.R` at season scale; emits the throw-frame slice. |
+| `06_build_throw_frame.R` | built | Applies `R/arrival.R` at season scale; emits `arrival.parquet`, `approach.parquet`, and the throw-frame slice `throw_frame.parquet` (§6.9). Measured facts only; no outcome columns. |
 | `07_build_features.R` | planned | Throw-frame coverage features. |
 | `08_build_model_frame.R` | planned | Model-frame assembly, question-level population filters with their own funnel, leak assertions. |
 
@@ -44,6 +44,7 @@ written as a side effect of rendering `analysis/01_eda.qmd`.
 | `analysis/01_eda.qmd` | Data audit and sample-definition report. Writes nothing. |
 | `analysis/02_arrival_anchor.qmd` | Arrival-anchor investigation. Writes nothing. |
 | `analysis/03_model_baseline.qmd` | Baseline models and scoring. Writes nothing to `data/`; assembles the model frame inline until `08` exists. |
+| `analysis/04_arrival_season.qmd` | Season-scale validation of the arrival anchor (§6.9). Writes nothing. |
 
 `R/arrival.R` exists as a helper rather than living inside `06` because the
 notebook is a second caller, and duplicated measurement logic goes stale. The
@@ -448,8 +449,7 @@ labeled week is 13 games (§3).
 
 Reported in full in `analysis/02_arrival_anchor.qmd`. All counts below are
 **week 1 only** ($n = 890$ plays with a tracked target, across 13 games) except
-§6.1, which is full-season. Re-validate at season scale once `06` runs; the
-checklist is §6.8.
+§6.1, which is full-season. The season-scale re-validation is §6.9.
 
 Every coverage feature is anchored to two points: the ball at the throw, and the
 ball at arrival. The throw is unambiguous. Arrival required three attempts.
@@ -592,7 +592,7 @@ Three components of the rule:
 - *$\delta$ sensitivity* — frame agreement $0.869$ at $\delta = 1.0$ and $0.817$
   at $1.6$, median shift 0 in both directions, against $0.382$ for $\epsilon$.
 - *Face validity* — median $d_{\min}$ on completions $0.121$ yd.
-- *Class similarity* — median $d_{\text{arr}}$ of $0.690$ yd (C) and $1.16$ yd
+- *Class similarity* — median $d_{\text{arr}}$ of $0.696$ yd (C) and $1.16$ yd
   (I). A caught ball genuinely ends up closer to the receiver than a dropped
   one; similarity across classes, not proximity to zero, is the target.
 - *Relationship to `pass_arrived`* — the label fires at a consistent
@@ -619,10 +619,9 @@ Three components of the rule:
 `frames_to_min` is catch-plus-carry duration, not a gather time. Median 8
 frames on completions, 0 on incompletions.
 
-$\approx 2.8\%$ of plays never reach flight speed inside the window
-(`used_fallback`) and fall back to closest approach. These are batted balls and
-soft flips with very short lanes; most are expected to exit at the
-beyond-the-LOS filter.
+About 3% of plays never reach flight speed inside the window (`used_fallback`)
+and fall back to closest approach: batted balls and soft flips with very short
+lanes. Season-scale figures are in §6.9.
 
 ### 6.7 Two things `d_arr` must never be used for
 
@@ -636,19 +635,79 @@ $d_{\text{arr}}$ would reintroduce the selection on outcome that §6.1 rejected.
 Sensitivity to `used_fallback` and `at_window_edge` is checked at the model
 stage instead.
 
-### 6.8 Full-season checks to re-run once `06` exists
+### 6.8 Full-season checks
 
-Before any feature work. The week-1 numbers above are the benchmark.
+Run before any feature work, with the week-1 numbers above as the benchmark.
+All five are reported in `analysis/04_arrival_season.qmd`; results in §6.9.
 
 1. **Class similarity** of $d_{\text{arr}}$, all 17 weeks.
 2. **Speed equalization** by 2-yd depth bin, all 17 weeks.
 3. **Bounce check**, since a rarer artifact may only appear at 17× the sample.
-4. **Three plays rendered with `render_play()`** — one completion, one
-   incompletion, one interception — stepped to $f_{\text{arr}}$.
+4. **Three plays drawn around $f_{\text{arr}}$** — one completion, one
+   incompletion, one interception — as static frame strips and as
+   `render_play()` animations (GIFs in `figs/week06/`, not committed).
 5. **External validation against `air_yards`.** Compare
    $x_{\text{arr}} - \texttt{los\_x}$ against nflverse `air_yards` (§8), an
    independently charted measurement of the same quantity. Also validates the
-   sign convention and settles the beyond-the-LOS threshold (§7).
+   sign convention and informs the beyond-the-LOS threshold (§7).
+
+### 6.9 Season-scale results
+
+`scripts/06_build_throw_frame.R` applies `detect_arrival()` to the 16,649 plays
+in the analytic sample with a tracked target. **16,646 have an arrival.** The
+other 3 have no frame after the throw on which both the ball and the target are
+tracked: one play's tracking ends at the throw frame, and in two the targeted
+receiver appears only on frames 1–2. (`target_tracked` records that the target
+appears in the tracking data at all, not that they are tracked at the throw.)
+553 plays (3.3%) use the closest-approach fallback; 57% of them arrive at or
+behind the line of scrimmage. 7 arrive at the 5.0 s window cap.
+
+**Week 1 reproduces the prototype:** 890 plays; median $d_{\text{arr}}$ 0.696
+(C) and 1.16 (I); median $d_{\min}$ on completions 0.121; median
+`frames_to_min` 8 (C).
+
+| Check | Week 1 | All 17 weeks |
+|---|---|---|
+| Median $d_{\text{arr}}$, C / I / IN | 0.70 / 1.16 / 1.69 | 0.73 / 1.09 / 1.61 |
+| Median $d_{\min}$, C | 0.12 | 0.12 |
+| C − I implied speed, worst of 11 bins | ≈ 1 yd/s | 0.62 yd/s |
+| Rise > 1 yd between $f_{\text{arr}}$ and $f_{\min}$ | 6 of 890 | 63 of 16,646 (0.38%); p99 0.60 yd |
+| Frame agreement, $\delta$ = 1.0 / 1.6 | 0.869 / 0.817 | 0.858 / 0.783 |
+| Frame agreement, gap tolerance 0 / 1 / 3 / 5 | — | 0.915 / 0.997 / 0.999 / 0.998 |
+
+Flight time: p50 0.8 s, p99 3.0 s. The 551 flights under 0.4 s have median
+depth −4.2 yd: shovels, screens, and batted balls at or behind the line.
+
+**Implied ball speed is not flat across depth at season scale.** It rises from
+about 18 yd/s on 8–10 yd lanes to about 22.5 yd/s beyond 18 yd, then levels
+off. Completions and incompletions trace the same curve, so this is not an
+outcome artifact. Short passes are thrown with more touch, and any fixed offset
+in the `pass_forward` frame inflates flight time proportionally more on short
+lanes; the data cannot separate the two. The week-1 description "flat at
+≈ 21 yd/s" (§6.6) reflected the smaller sample.
+
+**Visual check.** Three plays drawn four frames around arrival
+(`figs/week06/arrival_frames.png`). The completion and incompletion show the
+ball moving down the lane and sitting at the arrival point at $f_{\text{arr}}$.
+The interception (Flacco scrambling to the right sideline and throwing deep;
+intercepted 8.9 yd from the intended receiver) has the anchor on the last
+flight frame before the defender's catch.
+
+**External validation against `air_yards`** (16,641 throws with both):
+
+| | Value |
+|---|---|
+| Correlation, $\text{depth}_{\text{arr}}$ vs `air_yards` | 0.965 |
+| Median $\text{depth}_{\text{arr}} - $ `air_yards` | −0.68 yd (IQR −1.44 to 0.03) |
+| Median difference, C / I / IN | −0.66 / −0.74 / −1.22 yd |
+| Throws charted at exactly 0: median tracking depth | −0.70 yd; 77% at or behind the line |
+
+The sign convention and line of scrimmage are right, and the offset does not
+depend on the outcome. Tracking depth runs slightly short because the anchor is
+the last in-flight frame, about one frame before the ball reaches the receiver,
+while charting records the catch point; the shortfall grows on deep throws (mean
+−2.1 yd at 20+ charted air yards), where the ball covers about 2 yd per frame.
+Charted zero is a convention for throws at the line.
 
 ---
 
@@ -691,6 +750,24 @@ cross-validation. Details in §9.
 - **Spikes and scrambles** are already out of the base sample (§4.9).
 - **Four untargeted interceptions** reviewed on video and excluded with the
   other untargeted throws (§4.9).
+- **Beyond-the-LOS threshold: $\text{depth}_{\text{arr}} > 0$**, the ball
+  arrives beyond the line of scrimmage (§6.9). A population filter, applied in
+  `08`. On the 16,641 throws with both measures:
+
+  | Rule | Kept | Kept, charted ≤ 0 | Dropped, charted > 0 | Complete, kept / dropped |
+  |---|---|---|---|---|
+  | $\text{depth}_{\text{arr}} > 0$ | 13,147 (79.0%) | 330 | 453 | 63.8% / 78.4% |
+  | $\text{depth}_{\text{arr}} > 0.5$ | 12,796 (76.9%) | 230 | 704 | 63.4% / 78.4% |
+  | $\text{depth}_{\text{arr}} > 1$ | 12,376 (74.4%) | 170 | 1,064 | 62.7% / 78.8% |
+  | `air_yards` > 0 (charted) | 13,270 (79.7%) | — | — | 63.3% / 81.0% |
+
+  Zero follows from the definition rather than a fit; it keeps within 123 throws
+  of the charted rule and disagrees with it on 4.7% of throws. Raising the
+  threshold mostly drops throws charted beyond the line. The excluded throws are
+  mostly screens and other easy completions, so the filter is a population
+  definition, reported with its composition. Consequence for stage 2: once
+  $\text{depth}_{\text{arr}}$ replaces `air_yards`, `air_yards_zero` (a
+  charting artifact) leaves the spec.
 - **`keep_arrival`** appears in no rule (§4.8).
 - **Resampling unit for $\Delta$ log loss intervals: game** (§9.5).
 - **Calibration method** (§9.6) and **`cp` benchmark method** (§9.7): fixed
@@ -700,13 +777,6 @@ cross-validation. Details in §9.
 
 ### Open
 
-- **Beyond-the-LOS threshold.** Of the 17,343 spine plays with charted
-  `air_yards`, **20.9% are at or below zero** — 2,529 negative and **1,093 at
-  exactly zero**. The threshold is to be set on the continuous tracking-derived
-  throw distance from `06` and validated against `air_yards` (§6.8). Provisional
-  cost: roughly a fifth of the sample. Consequence for stage 2: the filter
-  removes most or all `air_yards == 0` plays, leaving `air_yards_zero` constant
-  or nearly so; it must then leave the spec.
 - **Penalty-nullified plays.** All 633 are currently excluded by `keep_los`
   (§4.7), not by decision. Retaining them, or running the `keep_official_play`
   sensitivity, first requires recovering `los_x` for them, e.g. from the ball
@@ -735,7 +805,7 @@ inappropriate for this question:
 | QB spikes | Already out of the base sample (§4.9) |
 | Throwaways, intentional grounding, untargeted passes | Out via the targeted-receiver population (§4.9) |
 | Penalty-nullified plays | Already out via `keep_los` (§4.7); open above |
-| Screens and other passes behind the LOS | Beyond-the-LOS filter (open) |
+| Screens and other passes behind the LOS | Beyond-the-LOS filter, $\text{depth}_{\text{arr}} > 0$ (applied in `08`) |
 | Batted or tipped passes at the line | Not yet flagged |
 | Hail Marys | Not yet flagged |
 | Goal-line plays with extra linemen | Not yet flagged |
@@ -743,11 +813,10 @@ inappropriate for this question:
 
 ### Feature state
 
-`R/geometry.R`, `R/arrival.R`, `R/pbp.R`, `R/evaluate.R`, and scripts 01–05
-exist; `pbp.parquet` is built. Stages 1 and 2 are fit and scored (§9). No
-tracking feature table exists yet. `06` is next after the scoring work: apply
-`detect_arrival()` at season scale and emit the throw-frame slice (all tracked
-players at $f_{\text{throw}}$ and at $f_{\text{arr}}$).
+`R/geometry.R`, `R/arrival.R`, `R/pbp.R`, `R/evaluate.R`, and scripts 01–06
+exist. `arrival.parquet` and `throw_frame.parquet` are built and validated
+(§6.9). Stages 1 and 2 are fit and scored (§9). No tracking feature table
+exists yet: `07_build_features.R` is next.
 
 ### Deferred to future work
 
@@ -1216,3 +1285,11 @@ the reference point for stages 3 and 4.
   seconds remaining in the quarter, or re-parse in `02`, before using it.
 - `paired_delta()` sets its seed through `withr::with_seed()`, leaving the
   global RNG untouched.
+- **gganimate under knitr reads the chunk's figure options as device
+  defaults**, including `units = "in"`, so a `width = 800` meant as pixels
+  becomes 800 inches and the render appears to hang. `render_play()` passes
+  `units = "px"` explicitly. GIFs need `gifski` (recorded in `renv.lock`, as is
+  `av` for mp4).
+- **Each `gt_theme_538()` table embeds its own copy of the Google fonts** under
+  `embed-resources: true`, so notebooks with many tables render to HTML files of
+  80+ MB. Harmless, since rendered HTML is not committed.
