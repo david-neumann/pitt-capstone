@@ -13,6 +13,11 @@
 # and `d_min`, which measure the catch itself (notes/decisions.md §6.7,
 # §8.5).
 #
+# Also carried, for analysis/05_robustness.qmd: charted `air_yards` and
+# `yards_to_go` (to rebuild distance to the sticks from charted depth), the
+# p90-motion-constant timing features, and the arrival and defect
+# diagnostics.
+#
 # Outputs, in data/processed/:
 #   model_frame.parquet   one row per play in the population
 #   model_funnel.parquet  step-by-step attrition with outcome shares
@@ -78,7 +83,9 @@ features <- P("features.parquet") |>
     lev_angle,
     tta_nearest,
     window_margin,
-    window_n_pos
+    window_n_pos,
+    tta_nearest_p90,
+    window_margin_p90
   )
 
 keys <- c("game_id", "play_id")
@@ -134,7 +141,10 @@ model_frame <- prepared[
     cp,
     has_cp,
     air_yards,
+    yards_to_go,
     window_n_pos,
+    tta_nearest_p90,
+    window_margin_p90,
     used_fallback,
     at_window_edge,
     has_kinematic_defect,

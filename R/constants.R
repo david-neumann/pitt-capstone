@@ -46,6 +46,11 @@ MAX_ACCEL <- 20 # yd/s^2
 PLAYER_S_MAX <- 9.22 # yd/s
 PLAYER_A_MAX <- 5.90 # yd/s^2
 
+# The p90 across players of the same per-player statistics, for the
+# robustness refit (analysis/05_robustness.qmd).
+PLAYER_S_MAX_P90 <- 9.98 # yd/s
+PLAYER_A_MAX_P90 <- 6.50 # yd/s^2
+
 # ---- arrival detection -----------------------------------------------
 # See R/arrival.R and notes/decisions.md §6.
 

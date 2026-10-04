@@ -1,0 +1,348 @@
+---
+title: "Robustness of the stage comparisons"
+subtitle: "STAT 1961 Capstone — sensitivity of the tracking gain to measurement and sample choices"
+author: "David Neumann"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: [brite, ../theme/capstone.scss]
+    code-summary: "Show code"
+    fig-width: 8
+    fig-height: 5
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 0. Setup
+
+```{r}
+#| label: setup
+#| include: false
+if (Sys.getenv("RENV_PROJECT") == "") {
+  root <- normalizePath("..", mustWork = TRUE)
+  Sys.setenv(RENV_PROJECT = root)
+  setwd(root)
+  source("renv/activate.R")
+}
+
+library(tidyverse)
+library(arrow)
+library(here)
+library(gt)
+library(gtExtras)
+library(scales)
+
+# mgcv must be attached: the spec formulas use bare s() and ti().
+library(mgcv)
+
+source(here("R", "constants.R"))
+source(here("R", "utils.R"))
+source(here("R", "evaluate.R"))
+```
+
+## 0.1 What this notebook is
+
+`analysis/03_model_baseline.qmd` scores four nested stages on
+`model_frame.parquet` and finds that coverage geometry at the throw (stage 4)
+improves on the play-by-play baseline (stage 2) by more than the play-by-play
+features improve on the base rate. This notebook checks whether that comparison
+depends on choices made along the way (`notes/decisions.md` §6.7, §7):
+
+| Check | Change |
+|---|---|
+| R1 | Charted `air_yards` (with its zero indicator) instead of the tracking depth $\text{depth}_{\text{arr}}$, everywhere depth enters |
+| R2 | Stage 4's timing features with the p90 motion constants (9.98 yd/s, 6.50 yd/s²) instead of the median (9.22, 5.90) |
+| R3 | Without plays whose arrival used the closest-approach fallback |
+| R4 | Without plays with a kinematic defect outside the snap-to-throw window |
+| R5 | Without plays with a QB hit (the QB-hit term leaves the specs) |
+| R6 | Without plays whose closest approach is at the last searched frame |
+
+Each check refits the stages with leave-one-week-out cross-validation and reports
+the paired differences in out-of-fold log loss with game-cluster bootstrap
+intervals, as in notebook 03. R6 selects on the outcome — those plays are mostly
+completions where the receiver carries the ball — so it is reported with that
+caveat rather than as a clean check.
+
+It reads `model_frame.parquet` and writes nothing to `data/`.
+
+```{r}
+#| label: load_data
+
+mf <- read_parquet(here("data", "processed", "model_frame.parquet"))
+stopifnot(identical(mf, assert_complete(mf)))
+```
+
+# 1. Method
+
+```{r}
+#| label: helpers
+
+stage_specs <- MODEL_SPECS[c("2. play-by-play", "3. + separation", "4. + geometry")]
+
+# Replace variable names inside each spec's formula, keeping its environment.
+swap_vars <- function(specs, from, to) {
+  map(specs, \(spec) {
+    txt <- paste(deparse(spec$formula, width.cutoff = 500L), collapse = " ")
+    for (k in seq_along(from)) {
+      txt <- gsub(from[k], to[k], txt, fixed = TRUE)
+    }
+    spec$formula <- stats::as.formula(txt, env = environment(spec$formula))
+    spec
+  })
+}
+
+edit_terms <- function(specs, change) {
+  map(specs, \(spec) {
+    spec$formula <- stats::update(spec$formula, change)
+    spec
+  })
+}
+
+pairs <- tribble(
+  ~reference, ~model, ~comparison,
+  "2. play-by-play", "3. + separation", "stage 3 - stage 2",
+  "2. play-by-play", "4. + geometry", "stage 4 - stage 2",
+  "3. + separation", "4. + geometry", "stage 4 - stage 3"
+)
+
+score <- function(preds, df, label) {
+  ll <- preds |>
+    group_by(model) |>
+    summarize(log_loss = log_loss(complete, .pred), .groups = "drop")
+
+  deltas <- pmap(pairs, \(reference, model, comparison) {
+    paired_delta(preds, reference, model, "game_id") |>
+      mutate(comparison = comparison)
+  }) |>
+    list_rbind()
+
+  deltas |>
+    select(comparison, estimate, conf_low, conf_high) |>
+    mutate(
+      scenario = label,
+      n = nrow(df),
+      base_rate = mean(df$complete),
+      ll_stage2 = ll$log_loss[ll$model == "2. play-by-play"],
+      ll_stage4 = ll$log_loss[ll$model == "4. + geometry"]
+    )
+}
+
+run <- function(df, specs, label) {
+  assert_complete(df, vars = model_vars(specs))
+  folds <- make_folds(df)
+  preds <- cv_predict_all(df, folds, specs = specs, verbose = FALSE)
+  list(preds = preds, result = score(preds, df, label))
+}
+```
+
+The baseline run must reproduce notebook 03's stage comparisons exactly, which
+checks the harness before anything is varied.
+
+```{r}
+#| label: baseline
+
+base <- run(mf, stage_specs, "baseline")
+
+base$result |>
+  select(comparison, estimate, conf_low, conf_high) |>
+  gt() |>
+  tab_header(title = "Baseline, reproducing notebook 03") |>
+  fmt_number(columns = c(estimate, conf_low, conf_high), decimals = 4) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+# 2. Measurement choices
+
+## 2.1 R1: charted air yards
+
+```{r}
+#| label: r1-air-yards
+
+mf_air <- mf |>
+  mutate(
+    dist_to_sticks_air = air_yards - yards_to_go,
+    air_yards_zero = as.integer(air_yards == 0)
+  )
+
+specs_air <- stage_specs |>
+  swap_vars(
+    c("depth_arr", "dist_to_sticks"),
+    c("air_yards", "dist_to_sticks_air")
+  ) |>
+  edit_terms(. ~ . + air_yards_zero)
+
+r1 <- run(mf_air, specs_air, "R1 charted air yards")
+```
+
+## 2.2 R2: motion constants
+
+Only stage 4 uses the motion model, so stage 4 is refit with the p90 timing
+features and compared against the baseline's stages 2 and 3.
+
+```{r}
+#| label: r2-motion
+
+mf_p90 <- mf |>
+  mutate(tta_nearest = tta_nearest_p90, window_margin = window_margin_p90)
+
+# Folds from mf_p90 itself: an rsample split carries the data it was built
+# from, so folds built from mf would refit on the median-constant features.
+folds_p90 <- make_folds(mf_p90)
+preds_r2 <- bind_rows(
+  filter(base$preds, model != "4. + geometry"),
+  cv_predict(
+    mf_p90,
+    folds_p90,
+    stage_specs[["4. + geometry"]],
+    "4. + geometry",
+    verbose = FALSE
+  )
+)
+
+# The refit must actually differ from the baseline's stage 4.
+stopifnot(!isTRUE(all.equal(
+  preds_r2$.pred[preds_r2$model == "4. + geometry"],
+  base$preds$.pred[base$preds$model == "4. + geometry"]
+)))
+r2 <- list(result = score(preds_r2, mf, "R2 p90 motion constants"))
+
+# Stage 4 with p90 constants against stage 4 with median constants.
+d_p90 <- paired_delta(
+  bind_rows(
+    filter(base$preds, model == "4. + geometry"),
+    filter(preds_r2, model == "4. + geometry") |> mutate(model = "4 (p90)")
+  ),
+  "4. + geometry",
+  "4 (p90)",
+  "game_id"
+)
+```
+
+With the p90 constants, stage 4's out-of-fold log loss changes by
+`r sprintf("%+.4f", d_p90$estimate)` [`r sprintf("%+.4f", d_p90$conf_low)`,
+`r sprintf("%+.4f", d_p90$conf_high)`] nats against the median constants.
+
+# 3. Sample choices
+
+```{r}
+#| label: r3-r6
+
+r3 <- run(filter(mf, !used_fallback), stage_specs, "R3 without arrival fallbacks")
+r4 <- run(filter(mf, !has_kinematic_defect), stage_specs, "R4 without kinematic defects")
+r5 <- run(
+  filter(mf, qb_hit == 0),
+  edit_terms(stage_specs, . ~ . - s(depth_arr, by = qb_hit)),
+  "R5 without QB-hit plays"
+)
+r6 <- run(filter(mf, !at_window_edge), stage_specs, "R6 without at_window_edge (outcome-selected)")
+```
+
+# 4. Results
+
+```{r}
+#| label: results
+
+results <- bind_rows(
+  base$result,
+  r1$result,
+  r2$result,
+  r3$result,
+  r4$result,
+  r5$result,
+  r6$result
+) |>
+  mutate(scenario = fct_inorder(scenario))
+
+results |>
+  mutate(value = sprintf("%.4f [%.4f, %.4f]", estimate, conf_low, conf_high)) |>
+  select(scenario, n, base_rate, ll_stage2, ll_stage4, comparison, value) |>
+  pivot_wider(names_from = comparison, values_from = value) |>
+  gt() |>
+  tab_header(
+    title = "Out-of-fold log loss differences under each check",
+    subtitle = "Game-cluster bootstrap, 10,000 draws, 95% percentile interval"
+  ) |>
+  fmt_number(columns = n, decimals = 0) |>
+  fmt_number(columns = c(base_rate, ll_stage2, ll_stage4), decimals = 4) |>
+  gt_theme_538(quiet = TRUE)
+
+rs <- function(scenario_prefix, comparison, col = "estimate") {
+  results[[col]][
+    startsWith(as.character(results$scenario), scenario_prefix) &
+      results$comparison == comparison
+  ]
+}
+```
+
+```{r}
+#| label: results-plot
+#| fig-height: 5
+
+p_rob <- results |>
+  filter(comparison != "stage 4 - stage 3") |>
+  ggplot(aes(estimate, fct_rev(scenario), colour = comparison)) +
+  geom_vline(xintercept = 0, linewidth = 0.3, colour = "grey40") +
+  geom_pointrange(
+    aes(xmin = conf_low, xmax = conf_high),
+    position = position_dodge(width = 0.5),
+    size = 0.3
+  ) +
+  labs(
+    title = "Tracking gain over the play-by-play baseline, by check",
+    subtitle = "Out-of-fold log loss difference, 95% game-cluster interval",
+    x = "difference in log loss (nats; negative favours the later stage)",
+    y = NULL,
+    colour = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave(
+  here("figs", "week06", "robustness.png"),
+  p_rob,
+  width = 8,
+  height = 5,
+  dpi = 200
+)
+
+p_rob
+```
+
+**The tracking gain does not depend on any of these choices.** Across R1–R5,
+stage 4 improves on stage 2 by between
+`r sprintf("%.4f", -max(results$estimate[results$comparison == "stage 4 - stage 2" & !startsWith(as.character(results$scenario), "R6")]))`
+and
+`r sprintf("%.4f", -min(results$estimate[results$comparison == "stage 4 - stage 2" & !startsWith(as.character(results$scenario), "R6")]))`
+nats, against `r sprintf("%.4f", -rs("baseline", "stage 4 - stage 2"))` in the
+baseline, and every interval is well away from zero and overlaps the
+baseline's. Stage 3's gain over stage 2 and stage 4's over stage 3 are equally
+stable.
+
+- **R1, charted air yards.** Stage 2 is slightly *better* with charted air yards
+  than with the tracking depth (log loss
+  `r sprintf("%.4f", rs("R1", "stage 4 - stage 2", "ll_stage2"))` against
+  `r sprintf("%.4f", rs("baseline", "stage 4 - stage 2", "ll_stage2"))`): the
+  charter records the catch or target point, which the last in-flight frame
+  approximates. The geometry's gain over that stronger baseline is
+  `r sprintf("%.4f", -rs("R1", "stage 4 - stage 2"))`
+  [`r sprintf("%.4f", -rs("R1", "stage 4 - stage 2", "conf_high"))`,
+  `r sprintf("%.4f", -rs("R1", "stage 4 - stage 2", "conf_low"))`], so the
+  result does not rest on the depth measure.
+- **R2, motion constants.** The p90 constants fit slightly worse than the
+  median ones (above), and the gain is essentially unchanged: the choice of
+  motion-model parameters does not drive the result.
+- **R3 and R4, arrival fallbacks and kinematic defects.** Dropping either set
+  leaves every comparison where it was.
+- **R5, QB-hit plays.** Dropping them, and the QB-hit term with them, leaves
+  every comparison where it was.
+- **R6, `at_window_edge`.** The gain is larger without these plays, but they are
+  mostly completions where the receiver carries the ball, so dropping them
+  lowers the base rate from
+  `r sprintf("%.3f", rs("baseline", "stage 4 - stage 2", "base_rate"))` to
+  `r sprintf("%.3f", rs("R6", "stage 4 - stage 2", "base_rate"))` and changes the
+  population on the outcome. It is not evidence either way; it shows only that
+  these plays are not where the gain comes from.

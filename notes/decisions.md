@@ -45,6 +45,7 @@ written as a side effect of rendering `analysis/01_eda.qmd`.
 | `analysis/02_arrival_anchor.qmd` | Arrival-anchor investigation. Writes nothing. |
 | `analysis/03_model_baseline.qmd` | Models, scoring, calibration, and the `cp` benchmark, on `model_frame.parquet`. Writes nothing to `data/`. |
 | `analysis/04_arrival_season.qmd` | Season-scale validation of the arrival anchor (§6.9). Writes nothing. |
+| `analysis/05_robustness.qmd` | Robustness of the stage comparisons (§9.11). Writes nothing to `data/`. |
 
 `R/arrival.R` exists as a helper rather than living inside `06` because the
 notebook is a second caller, and duplicated measurement logic goes stale. The
@@ -804,6 +805,9 @@ cross-validation. Details in §9.
   magnitude is `sep_throw` (§9.9).
 - **Stage 4 deep-throw calibration** (slope 0.86 [0.73, 0.996] on 20+ yd) is
   reported, not corrected: it is the last stage (§9.9).
+- **Robustness checks** (§9.11): charted `air_yards`, p90 motion constants,
+  and excluding arrival fallbacks, kinematic defects, QB-hit plays, and
+  `at_window_edge` plays. None moves the stage comparisons materially.
 - **Stage 3 depth interaction: separation × depth**, `ti(sep_throw, depth_arr)`
   (§9.8). Without it stage 3 was too extreme on deep throws (calibration slope
   0.73 [0.59, 0.86] on 20+ yd), the same pattern as QB hit before its
@@ -816,14 +820,10 @@ cross-validation. Details in §9.
   (§4.7), not by decision. Retaining them, or running the `keep_official_play`
   sensitivity, first requires recovering `los_x` for them, e.g. from the ball
   position at the snap.
-- **Robustness**: refit with `PLAYER_S_MAX` at $9.22$ and $9.98$ and report that
-  log loss barely moves.
 - **Man/zone** — whether the binary earns a place in the model, given §5 and
   the 13-game denominator.
 - **QB kinematic state** — listed among the geometry features in earlier
   framing but not assigned to stage 3 or 4.
-- **Robustness: charted `air_yards`.** Refit stage 2 with charted `air_yards`
-  in place of $\text{depth}_{\text{arr}}$ (§9.3).
 
 ### Play types measurable but not yet filtered
 
@@ -845,7 +845,7 @@ inappropriate for this question:
 
 The full pipeline, scripts 01–08, is built. `model_frame.parquet` (13,125
 throws) is the scoring population for stages 1–4 and the `cp` benchmark (§9).
-Remaining work is robustness checks and the report.
+Robustness checks are done (§9.11). Remaining work is the report.
 
 ### Deferred to future work
 
@@ -1099,7 +1099,7 @@ in-sample $p$-value.**
 replaced charted `air_yards` once `06` existed. The `air_yards == 0` indicator
 went with it: it captured the charting convention of recording throws at the
 line as exactly zero, and the tracking depth is continuous. A refit with
-charted `air_yards` is an open robustness check (§7).
+charted `air_yards` is a robustness check (§9.11).
 
 Stage 2 follows `cp`'s feature set where BDB supports it. Departures:
 
@@ -1424,6 +1424,44 @@ For the record; superseded by the sections above.
 | Targeted receiver, charted air yards, QB hit × depth | 16,643 | −0.0626 [−0.0678, −0.0573] | +0.0065 [+0.0048, +0.0083] |
 | + beyond the line, tracking depth (stages 1–3 inputs) | 13,145 | −0.0553 [−0.0613, −0.0495] | +0.0094 [+0.0072, +0.0116] |
 | **Final:** stages 1–4 inputs complete | 13,125 | −0.0554 [−0.0614, −0.0496] | +0.0093 [+0.0071, +0.0115] |
+
+### 9.11 Robustness
+
+`analysis/05_robustness.qmd` refits the stages under alternative measurement
+and sample choices, with leave-one-week-out cross-validation and game-cluster
+intervals as in §9.5. A baseline run reproduces §9.8–9.9 exactly first.
+
+| Check | n | Stage 2 log loss | Stage 4 − stage 2 | Stage 3 − stage 2 | Stage 4 − stage 3 |
+|---|---|---|---|---|---|
+| Baseline | 13,125 | 0.5994 | −0.0563 [−0.0622, −0.0503] | −0.0444 [−0.0495, −0.0392] | −0.0119 [−0.0148, −0.0091] |
+| R1 charted `air_yards` (and its zero indicator) | 13,125 | 0.5947 | −0.0546 [−0.0604, −0.0486] | −0.0438 [−0.0490, −0.0387] | −0.0108 [−0.0135, −0.0081] |
+| R2 p90 motion constants (stage 4 only) | 13,125 | 0.5994 | −0.0557 [−0.0616, −0.0498] | (as baseline) | −0.0113 [−0.0142, −0.0085] |
+| R3 without arrival fallbacks | 12,890 | 0.6011 | −0.0563 [−0.0624, −0.0501] | −0.0431 [−0.0482, −0.0379] | −0.0132 [−0.0164, −0.0100] |
+| R4 without kinematic defects | 12,778 | 0.6011 | −0.0562 [−0.0621, −0.0502] | −0.0447 [−0.0499, −0.0395] | −0.0115 [−0.0143, −0.0086] |
+| R5 without QB-hit plays | 11,927 | 0.5920 | −0.0561 [−0.0626, −0.0496] | −0.0443 [−0.0501, −0.0386] | −0.0118 [−0.0147, −0.0089] |
+| R6 without `at_window_edge` (outcome-selected) | 11,141 | 0.5947 | −0.0607 [−0.0672, −0.0542] | −0.0493 [−0.0552, −0.0433] | −0.0115 [−0.0144, −0.0084] |
+
+**The thesis comparison is robust.** Across R1–R5, stage 4 − stage 2 lies
+between −0.0546 and −0.0563, every interval far from zero and overlapping the
+baseline.
+
+- **R1.** Charted `air_yards` gives a slightly *stronger* stage 2 (0.5947
+  against 0.5994): the charter records the catch or target point, which the
+  last in-flight frame approximates. The geometry's gain over that baseline is
+  essentially unchanged.
+- **R2.** The p90 constants (`PLAYER_S_MAX_P90` 9.98 yd/s, `PLAYER_A_MAX_P90`
+  6.50 yd/s²) make stage 4 slightly *worse* than the median ones, by 0.0006
+  [0.0003, 0.0010] nats, and leave the gain unchanged.
+- **R3–R5.** Dropping arrival fallbacks (§6.6), plays with defects outside the
+  measurement window (§4.2), or QB-hit plays (§7, with the QB-hit term removed)
+  changes nothing.
+- **R6.** Larger gain, but these are mostly completions with a long carry, so
+  excluding them selects on the outcome (base rate 0.638 → 0.627). Reported
+  for completeness, not as evidence.
+
+Implementation: `07` writes `tta_nearest_p90` and `window_margin_p90` from the
+same function as the main timing features, and `08` carries them, with charted
+`air_yards` and `yards_to_go`, into `model_frame.parquet`.
 
 ## 10. Known technical constraints
 

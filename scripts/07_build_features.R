@@ -24,6 +24,10 @@
 #                  lane, seconds (notes/decisions.md §7)
 #   window_n_pos   number of those defenders with a positive margin;
 #                  descriptive only
+#   tta_nearest_p90, window_margin_p90
+#                  the same, with the p90 motion constants
+#                  (PLAYER_S_MAX_P90, PLAYER_A_MAX_P90), for the
+#                  robustness refit
 #
 # The nearest defender is determined at the throw frame. Ties go to the
 # lower nfl_id and are counted in `nearest_tied`. Missing `dir` propagates
@@ -119,6 +123,41 @@ nearest_geo <- nearest |>
   select(game_id, play_id, def_nfl_id, xr, yr, xd, yd, sd, dird) |>
   inner_join(lane, by = c("game_id", "play_id"))
 
+# Time-based features for given motion constants. `nearest_geo` has one row
+# per play (nearest defender and lane); `help` one row per other defender
+# with velocity components.
+time_features <- function(nearest_geo, help, v_max, a_max) {
+  v_n <- velocity_xy(nearest_geo$sd, nearest_geo$dird)
+
+  tta <- nearest_geo |>
+    transmute(
+      game_id,
+      play_id,
+      tta_nearest = t_flight -
+        time_to_point(xd, yd, v_n$vx, v_n$vy, x_arr, y_arr, v_max, a_max)
+    )
+
+  window <- tidyr::crossing(help, u = WINDOW_U) |>
+    mutate(
+      px = x_throw + u * (x_arr - x_throw),
+      py = y_throw + u * (y_arr - y_throw),
+      margin = u * t_flight -
+        time_to_point(xd, yd, vxd, vyd, px, py, v_max, a_max)
+    ) |>
+    group_by(game_id, play_id, def_nfl_id) |>
+    # NA when the defender's direction is missing, so it is not silently
+    # ignored in the play-level maximum below.
+    summarize(margin = max(margin), .groups = "drop") |>
+    group_by(game_id, play_id) |>
+    summarize(
+      window_margin = max(margin),
+      window_n_pos = sum(margin > 0),
+      .groups = "drop"
+    )
+
+  full_join(tta, window, by = c("game_id", "play_id"))
+}
+
 lev <- rotate_to_lane(
   nearest_geo$x_throw,
   nearest_geo$y_throw,
@@ -129,17 +168,13 @@ lev <- rotate_to_lane(
   nearest_geo$xr,
   nearest_geo$yr
 )
-v_n <- velocity_xy(nearest_geo$sd, nearest_geo$dird)
-
-stage4_nearest <- nearest_geo |>
+leverage <- nearest_geo |>
   mutate(
     l_par = lev$l_par,
     l_io = to_inside_outside(lev$l_perp, yr),
-    lev_angle = atan2(l_io, l_par),
-    tta_nearest = t_flight -
-      time_to_point(xd, yd, v_n$vx, v_n$vy, x_arr, y_arr)
+    lev_angle = atan2(l_io, l_par)
   ) |>
-  select(game_id, play_id, l_par, l_io, lev_angle, tta_nearest)
+  select(game_id, play_id, l_par, l_io, lev_angle)
 
 # Help defenders: every defender except the nearest, timed to each lane
 # position.
@@ -153,28 +188,24 @@ help <- defenders |>
 v_h <- velocity_xy(help$sd, help$dird)
 help <- mutate(help, vxd = v_h$vx, vyd = v_h$vy)
 
-margins <- tidyr::crossing(help, u = WINDOW_U) |>
-  mutate(
-    px = x_throw + u * (x_arr - x_throw),
-    py = y_throw + u * (y_arr - y_throw),
-    margin = u * t_flight - time_to_point(xd, yd, vxd, vyd, px, py)
-  ) |>
-  group_by(game_id, play_id, def_nfl_id) |>
-  # NA when the defender's direction is missing, so it is not silently
-  # ignored in the play-level maximum below.
-  summarize(margin = max(margin), .groups = "drop")
-
-window <- margins |>
-  group_by(game_id, play_id) |>
-  summarize(
-    window_margin = max(margin),
-    window_n_pos = sum(margin > 0),
-    .groups = "drop"
+timing <- time_features(nearest_geo, help, PLAYER_S_MAX, PLAYER_A_MAX)
+timing_p90 <- time_features(
+  nearest_geo,
+  help,
+  PLAYER_S_MAX_P90,
+  PLAYER_A_MAX_P90
+) |>
+  select(
+    game_id,
+    play_id,
+    tta_nearest_p90 = tta_nearest,
+    window_margin_p90 = window_margin
   )
 
 features <- features |>
-  left_join(stage4_nearest, by = c("game_id", "play_id")) |>
-  left_join(window, by = c("game_id", "play_id"))
+  left_join(leverage, by = c("game_id", "play_id")) |>
+  left_join(timing, by = c("game_id", "play_id")) |>
+  left_join(timing_p90, by = c("game_id", "play_id"))
 
 # Every play with an arrival has a target and at least one defender.
 features <- arrival |>
