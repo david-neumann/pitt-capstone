@@ -366,7 +366,9 @@ receiver, matching nflverse, which computes `cp` only when a receiver is named
 (§8.4). Throwaways, spikes, intentional grounding, and passes with no
 identifiable target are out of scope: the question is the completion
 probability of a pass to a receiver, and these have none. Applied in `08`
-(§0).
+(§0); until `08` exists, applied inline in `analysis/03_model_baseline.qmd`
+§1.2, which reads `receiver_player_name` from the nflverse mirror because
+`pbp.parquet` does not carry it yet.
 
 On the 17,077 thrown passes in the analytic sample, BDB's targeted receiver
 (`targetedReceiver.csv`, tracked) against nflverse's `receiver_player_name`:
@@ -691,6 +693,8 @@ cross-validation. Details in §9.
   other untargeted throws (§4.9).
 - **`keep_arrival`** appears in no rule (§4.8).
 - **Resampling unit for $\Delta$ log loss intervals: game** (§9.5).
+- **Calibration method** (§9.6) and **`cp` benchmark method** (§9.7): fixed
+  external predictions, no recalibration.
 
 ### Open
 
@@ -715,6 +719,13 @@ cross-validation. Details in §9.
 - **`FLAG_GROUP` relabel** for `keep_arrival` (§4.8).
 - **Depth control.** The tracking-derived throw distance replaces `air_yards`
   in stage 2 once `06` exists; `air_yards` becomes a robustness refit (§9.3).
+- **Stage 2 on deep throws.** Calibration slope 0.62 within 20+ air yards
+  (§9.6). Whether stage 2 should gain a depth interaction, given that this
+  changes the baseline geometry is measured against. Until decided, stage 3–4
+  results are reported by depth.
+- **`receiver_player_name` in `pbp.parquet`.** Add it to `PBP_COLS` and re-run
+  `05` (a rebuild of `data/processed/pbp.parquet`, no network) so `08` does not
+  read the interim mirror.
 
 ### Play types measurable but not yet filtered
 
@@ -914,9 +925,9 @@ are rejected in the model frame.
 ## 9. Baseline models and evaluation
 
 Implemented in `R/evaluate.R`, reported in `analysis/03_model_baseline.qmd`.
-**Provisional population:** the model frame is assembled in the notebook and no
-question-level filters (§4.9, beyond-the-LOS) are applied yet, so every number
-in this section will change when `08` exists.
+**Provisional population:** the model frame is assembled in the notebook, with
+the targeted-receiver filter (§4.9) applied inline. The beyond-the-LOS filter
+is not yet applied, so every number in this section will change when it is.
 
 ### 9.1 Response and scoring population
 
@@ -924,11 +935,18 @@ in this section will change when `08` exists.
 benchmark comparable.
 
 The model frame joins `analytic_sample.parquet`, `number_of_pass_rushers` from
-`plays.parquet`, and `pbp.parquet`, restricted to `pass_result` in {C, I, IN}:
-17,077 throws. **3 plays** lack a variable some spec requires (`air_yards` and
-its derived columns; one is the unmatched pbp play): 1 completion and 2
-incompletions, immaterial. Scoring population: **17,074 throws, base rate
-0.652864.**
+`plays.parquet`, `pbp.parquet`, and `receiver_player_name` from the nflverse
+mirror, restricted to `pass_result` in {C, I, IN}:
+
+| Step | Dropped | Remaining | Complete (kept) | Complete (dropped) |
+|---|---|---|---|---|
+| thrown passes | — | 17,077 | 65.3% | — |
+| nflverse receiver named (population) | 409 | 16,668 | 66.9% | 0.2% |
+| targeted receiver tracked (quality) | 25 | 16,643 | 66.9% | 84.0% |
+
+No play in the population lacks a variable any spec requires. Scoring
+population: **16,643 throws, base rate 0.668509**, every one carrying `cp`.
+(Before §4.9, 3 of 17,077 throws lacked `air_yards`; none passes the filter.)
 
 **Assert, don't filter.** `assert_complete()` fails on any NA in any spec
 variable rather than dropping rows, and every fit uses `na.action = na.fail`:
@@ -942,14 +960,15 @@ specs.
   level is absent from a training fold. Affects nothing in the current spec;
   written when `offense_formation` was in the model (WILDCAT: 31 plays, 17 in
   week 14). `NA` stays `NA`.
-- **`number_of_pass_rushers` clamped to [2, 7]**, moving 117 plays (values 0:
-  16, 1: 72, 8: 28, 9: 1). Zero rushers on a pass play is a charting artifact,
-  and sparse tails would be extrapolated in the folds that hold them out.
+- **`number_of_pass_rushers` clamped to [2, 7].** On the 17,077 throws before
+  §4.9 this moved 117 plays (values 0: 16, 1: 72, 8: 28, 9: 1). Zero rushers on
+  a pass play is a charting artifact, and sparse tails would be extrapolated in
+  the folds that hold them out.
 - **`dist_to_sticks = air_yards - yards_to_go`** replaces `yards_to_go`. Additive
   smooths in `air_yards` and `yards_to_go` cannot represent whether the throw
   reaches the line to gain; all three together are linearly dependent.
-- **`air_yards_zero`** flags throws at exactly zero air yards (1,013 throws), a
-  point mass a penalized smooth cannot capture.
+- **`air_yards_zero`** flags throws at exactly zero air yards (923 in the
+  population), a point mass a penalized smooth cannot capture.
 - **`home`**: offense is the home team.
 
 ### 9.3 Stage specifications
@@ -969,34 +988,37 @@ in-sample $p$-value.**
 Stage 2 follows `cp`'s feature set where BDB supports it. Departures:
 
 - **Three pass locations**, not middle/not-middle. Against left, middle is
-  $+0.178$ (SE 0.046) and right $-0.140$ (SE 0.039); collapsing left and right
-  would merge levels that differ by about 3.6 SE.
-- **`number_of_pass_rushers` added** ($\chi^2 = 39.7$, edf 1.00): a defensive
+  $+0.177$ (SE 0.047) and right $-0.058$ (SE 0.040, $p = 0.15$). Middle differs
+  from both sides. Left and right differed by about 3.6 SE on the population
+  before §4.9 and are not distinguishable on this one; the three-level coding is
+  kept rather than revised on a $p$-value.
+- **`number_of_pass_rushers` added** ($\chi^2 = 40.0$, edf 1.01): a defensive
   control, so stage 3–4 features cannot be said to recapture rushers versus
   droppers.
-- **`air_yards_zero` included**: $-0.87$ (SE 0.078) against an intercept of
-  $1.00$. Including it raised `s(air_yards)` edf from 4.37 to 7.67 and improved
-  deviance explained on a smaller model.
+- **`air_yards_zero` included**: $-0.67$ (SE 0.084) against an intercept of
+  $1.08$, about half the odds of completion. When it was added during
+  specification (on the population before §4.9), `s(air_yards)` edf rose from
+  4.37 to 7.67 and deviance explained improved on a smaller model.
 - `roof` and era omitted: era is meaningless in one season, and `roof` is not
   in `PBP_COLS`.
 
-Tested and dropped:
+Tested and dropped (during specification, on the population before §4.9):
 
 - **`offense_formation`**: describes scheme rather than difficulty, and is
   aliased with `shotgun` (an empty-backfield snap is essentially always from
-  shotgun), inflating standard errors from about 0.04 to about 0.35. Without it,
-  `shotgun` is $-0.171$ (SE 0.047): conditional on depth, shotgun passes complete
-  less often.
+  shotgun), inflating standard errors from about 0.04 to about 0.35.
 - **`defenders_in_the_box`** and **`score_differential`**: edf about 1.00 and
-  $p > 0.05$ in the week-6 fits, and droppable by argument — the box count is
-  vendor-charted with implausible tail values, and the blowout mechanism behind
-  score differential is absent from the data.
+  $p > 0.05$, and droppable by argument — the box count is vendor-charted with
+  implausible tail values, and the blowout mechanism behind score differential
+  is absent from the data.
 
-**Retained despite being null:** `s(dist_to_sticks)`, edf 1.01, $p = 0.10$. It
+**Retained despite being weak:** `s(dist_to_sticks)`, edf 1.03, $p = 0.07$. It
 is the model's only `yards_to_go` information.
 
-Other stage 2 effects: `qb_hit` $-0.88$ (SE 0.058), the largest parametric
-effect; third down $-0.16$ (SE 0.047). Deviance explained **9.85%** in-sample.
+Other stage 2 effects: `shotgun` $-0.258$ (SE 0.049) — conditional on depth,
+shotgun passes complete less often; `qb_hit` $-0.78$ (SE 0.060), the largest
+parametric effect; third down $-0.16$ (SE 0.048). `s(air_yards)` edf 7.09.
+Deviance explained **9.90%** in-sample.
 
 `air_yards` is provisional because it is charted, not measured. Once `06`
 exists, the tracking-derived throw distance replaces it and `air_yards` becomes
@@ -1010,7 +1032,7 @@ a robustness refit.
   2017).
 - **Pooled out-of-fold predictions**, not averaged per-fold metrics: with
   unequal folds the two differ, and only pooled predictions can be subset
-  (e.g. to `has_cp`) without refitting.
+  without refitting.
 - **REML** smoothness selection rather than mgcv's GCV default.
 - Predictions on the response scale, asserted complete and strictly inside
   (0, 1).
@@ -1029,9 +1051,10 @@ own rate. Both checks are asserted in the notebook.
 
 | | Out-of-fold log loss |
 |---|---|
-| $H(\bar y)$, $\bar y = 0.652864$ | 0.645656 |
-| Stage 1 | 0.645791 (+0.000135) |
-| Stage 2 | 0.583685 |
+| $H(\bar y)$, $\bar y = 0.668509$ | 0.6352 |
+| Stage 1 | 0.6353 (+0.00011) |
+| Stage 2 | 0.5740 |
+| nflverse `cp` | 0.5663 |
 
 **Paired $\Delta$ log loss** (`paired_delta()`): the mean of per-play
 differences, with a cluster bootstrap percentile interval (10,000 draws) that
@@ -1043,26 +1066,74 @@ check.
 
 | Stage 2 − stage 1 | $\Delta$ | 95% interval | SE (bootstrap) | SE (analytic) | SE (iid) | Design effect |
 |---|---|---|---|---|---|---|
-| game | −0.0621 | [−0.0673, −0.0570] | 0.00261 | 0.00261 | 0.00263 | 0.99 |
-| week | −0.0621 | [−0.0666, −0.0573] | 0.00239 | 0.00248 | 0.00263 | 0.89 |
+| game | −0.0613 | [−0.0666, −0.0561] | 0.00267 | 0.00266 | 0.00265 | 1.01 |
+| week | −0.0613 | [−0.0660, −0.0567] | 0.00239 | 0.00247 | 0.00265 | 0.87 |
 
 Clustering is immaterial for this comparison: game-level factors affect both
 stages' losses alike and cancel in the paired difference. The week design
 effect is within the noise of a 17-cluster estimate. Game clustering is kept
-because stage 3–4 gains may concentrate by game.
+because stage 3–4 gains may concentrate by game. (On the population before
+§4.9, 17,074 throws: $-0.0621$ [$-0.0673$, $-0.0570$].)
 
 Rejected: unpaired comparison of two intervals (ignores the shared play-level
 difficulty); a play-level bootstrap (ignores within-game dependence); refitting
 inside the bootstrap (about 340,000 fits).
 
-### 9.6 Pending
+### 9.6 Calibration
 
-Calibration (reliability overall and within air-yards and separation buckets),
-and the `cp` benchmark. Under §4.9, `cp` is available on every play in the
-population, so the benchmark is scored on the full population rather than a
-subset.
+**Measures** (Van Calster et al., 2019): calibration-in-the-large
+$\text{CITL} = \bar y - \bar{\hat p}$; the calibration intercept $a$ in
+$\operatorname{logit} P(y = 1) = a + \operatorname{logit}\hat p$; and the
+calibration slope $b$ in
+$\operatorname{logit} P(y = 1) = a' + b\operatorname{logit}\hat p$ (1 when
+calibrated, below 1 when predictions are too extreme). Intervals are
+game-cluster bootstrap percentiles (2,000 draws overall, 1,000 per subgroup)
+with predictions held fixed. ECE is not reported because it depends on the
+binning.
 
----
+**Display:** a smoothed calibration curve (binomial GAM of the outcome on
+$\operatorname{logit}\hat p$, pointwise 95% band) with 20 equal-count bins.
+Figures: `figs/week06/calibration.png`, `calibration_by_air_yards.png`.
+
+**Subgroups:** air-yards buckets with edges fixed in advance — $\le 0$, 1–9,
+10–19, 20+ (`air_yards_bucket()`). Separation buckets follow with stage 3.
+
+| | CITL | Slope |
+|---|---|---|
+| Stage 2 | 0.000 [−0.008, 0.008] | 0.990 [0.944, 1.039] |
+| `cp` | 0.005 [−0.003, 0.013] | 1.022 [0.979, 1.067] |
+
+| Air yards (n) | Stage 2 slope | `cp` slope |
+|---|---|---|
+| $\le 0$ (3,371) | 0.96 [0.79, 1.13] | 0.97 [0.85, 1.10] |
+| 1–9 (7,679) | 0.98 [0.87, 1.08] | 1.01 [0.91, 1.11] |
+| 10–19 (3,601) | 0.97 [0.81, 1.12] | 1.01 [0.88, 1.15] |
+| 20+ (1,992) | **0.62 [0.41, 0.84]** | 1.05 [0.79, 1.32] |
+
+CITL intervals contain zero in every bucket for both. **Stage 2 is too extreme
+within deep throws**: its additive terms move predictions among deep throws at
+the strength they have across all throws, and the outcomes do not support that
+spread. `cp`, which can represent interactions, does not show it. Recorded as an
+open question (§7) rather than fixed, because adding a depth interaction would
+change the baseline that geometry is measured against. The stage 3–4
+comparison is to be reported by depth as well as overall.
+
+### 9.7 The `cp` benchmark
+
+`cp` is scored as a fixed external set of predictions on the same 16,643 rows;
+it is not refit or recalibrated.
+
+| Comparison (game clusters) | $\Delta$ | 95% interval |
+|---|---|---|
+| Stage 2 − `cp` | +0.0077 | [+0.0058, +0.0096] |
+| `cp` − stage 1 | −0.0691 | [−0.0743, −0.0638] |
+
+`cp` beats stage 2 by 0.0077 nats; stage 2 captures 89% of `cp`'s improvement
+over the base rate. Both are calibrated overall, so the gap is in
+discrimination. Plausible sources, not separable here: `cp`'s model class
+represents interactions (consistent with the deep-throw finding in §9.6), it is
+trained on far more plays, and 2018 is partly in its training data. The gap is
+the reference point for stages 3 and 4.
 
 ## 10. Known technical constraints
 

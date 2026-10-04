@@ -44,6 +44,7 @@ library(mgcv)
 
 source(here("R", "constants.R"))
 source(here("R", "utils.R"))
+source(here("R", "pbp.R"))
 source(here("R", "evaluate.R"))
 
 fig_dir <- here("figs", "week06")
@@ -67,12 +68,11 @@ than in a footnote.
 Nothing is written to disk, so the architectural rule holds, but these results
 are not yet reproducible from a build artifact.
 
-**The population filters for this question are not applied.** Beyond the line
-of scrimmage, a tracked targeted receiver, not a spike, not a scramble — none
-of them. These are results on the **full throw population**, every play in
-`analytic_sample.parquet` with `pass_result` in {C, I, IN}.
-
-The beyond-the-LOS filter alone will remove roughly a fifth of these plays
+**One of the question's population filters is applied, inline in §1.2**: a
+targeted receiver (`notes/decisions.md` §4.9). Spikes and scrambles are already
+absent from the analytic sample. The beyond-the-line-of-scrimmage filter is
+**not** applied, because its threshold waits on the tracking-derived throw
+distance from `06`. It will remove roughly a fifth of these plays
 (`notes/decisions.md` §7), which changes every number below. Stage 3 and 4
 features do not exist yet either, so what follows is the **floor and the
 baseline**, plus the external benchmark. The thesis is untested.
@@ -89,13 +89,21 @@ analytic_sample <- read_parquet(here(
 ))
 plays <- read_parquet(here("data", "processed", "plays.parquet"))
 pbp <- read_parquet(here("data", "processed", "pbp.parquet"))
+
+# pbp.parquet does not carry receiver names yet, so they are read from the
+# nflverse mirror. 08 takes this over.
+receivers <- read_parquet(
+  here("data", "interim", "pbp_2018.parquet"),
+  col_select = c("old_game_id", "play_id", "receiver_player_name")
+) |>
+  standardize_pbp_keys()
 ```
 
 # 1. The model frame
 
 ## 1.1 Assembly
 
-Three sources, joined on `(game_id, play_id)`. The join takes from each table
+Four sources, joined on `(game_id, play_id)`. The join takes from each table
 only the columns the other two lack, because `analytic_sample.parquet` already
 carries `down`, `yards_to_go`, `los_x`, and `week` — pulling them again would
 produce suffixed `.x` / `.y` pairs rather than an error.
@@ -105,6 +113,8 @@ produce suffixed `.x` / `.y` pairs rather than an error.
   carry forward because the sample rule did not need it
 - `pbp.parquet` — `air_yards`, `pass_location`, `qb_hit`, `shotgun`,
   `posteam_type`, and the benchmark columns `cp` / `has_cp`
+- the nflverse mirror — `receiver_player_name`, for the population filter in
+  §1.2
 
 `plays.parquet` is not widened by re-running `04`: the analytical sample is a
 locked artifact of the sample layer, and adding model covariates to it would
@@ -113,31 +123,32 @@ conflate the sample layer with the feature layer.
 ```{r}
 #| label: assemble
 
-model_input <- analytic_sample |>
+throws <- analytic_sample |>
   left_join(
     plays |> select(game_id, play_id, number_of_pass_rushers),
     by = c("game_id", "play_id")
   ) |>
   left_join(pbp, by = c("game_id", "play_id")) |>
+  left_join(receivers, by = c("game_id", "play_id")) |>
   filter(pass_result %in% c("C", "I", "IN"))
 
 tibble(
   quantity = c(
     "plays in analytic_sample",
     "thrown passes (C, I, IN)",
-    "removed: sacks and scrambles",
+    "removed: sacks carrying a throw event",
     "matched to play-by-play",
     "carrying the cp benchmark"
   ),
   n = c(
     nrow(analytic_sample),
-    nrow(model_input),
-    nrow(analytic_sample) - nrow(model_input),
-    sum(model_input$pbp_matched),
-    sum(model_input$has_cp)
+    nrow(throws),
+    nrow(analytic_sample) - nrow(throws),
+    sum(throws$pbp_matched),
+    sum(throws$has_cp)
   )
 ) |>
-  mutate(pct_of_throws = n / nrow(model_input)) |>
+  mutate(pct_of_throws = n / nrow(throws)) |>
   gt() |>
   fmt_percent(columns = pct_of_throws, decimals = 1) |>
   fmt_number(columns = n, decimals = 0) |>
@@ -150,7 +161,79 @@ rule defines the population as plays where a forward pass was *released*
 of plays; this filter is on the outcome code rather than the event, so it
 catches those.
 
-## 1.2 Derived predictors
+## 1.2 Population: a targeted receiver
+
+nflverse computes `cp` only when a receiver is named, and the question is the
+completion probability of a pass *to a receiver*. Throwaways, intentional
+grounding, and passes with no identifiable target are out of scope
+(`notes/decisions.md` §4.9). Two steps, applied here until
+`scripts/08_build_model_frame.R` exists:
+
+- **Population:** nflverse names a receiver.
+- **Quality:** BDB's targeted receiver is tracked. Without that, no coverage
+  geometry can be measured.
+
+Like every exclusion, each step is checked for a differential completion rate.
+
+```{r}
+#| label: population
+
+pop <- throws |>
+  mutate(
+    receiver_named = !is.na(receiver_player_name),
+    target_tracked = coalesce(target_tracked, FALSE),
+    is_complete = pass_result == "C"
+  )
+
+everything <- rep(TRUE, nrow(pop))
+named <- pop$receiver_named
+tracked <- named & pop$target_tracked
+
+pop_funnel <- tibble(
+  step = c(
+    "thrown passes",
+    "nflverse receiver named (population)",
+    "targeted receiver tracked (quality)"
+  ),
+  keep = list(everything, named, tracked),
+  before = list(everything, everything, named)
+) |>
+  mutate(
+    dropped = map2_int(before, keep, \(b, k) sum(b & !k)),
+    remaining = map_int(keep, sum),
+    complete_kept = map_dbl(keep, \(k) mean(pop$is_complete[k])),
+    complete_dropped = map2_dbl(
+      before,
+      keep,
+      \(b, k) if (any(b & !k)) mean(pop$is_complete[b & !k]) else NA_real_
+    )
+  ) |>
+  select(-keep, -before)
+
+pop_funnel |>
+  gt() |>
+  fmt_number(columns = c(dropped, remaining), decimals = 0) |>
+  fmt_percent(columns = c(complete_kept, complete_dropped), decimals = 1) |>
+  sub_missing(missing_text = "") |>
+  gt_theme_538(quiet = TRUE)
+
+model_input <- filter(pop, receiver_named, target_tracked)
+
+# The benchmark is defined on every play in the population.
+stopifnot(all(model_input$has_cp))
+```
+
+The `r comma(pop_funnel$dropped[2])` throws with no named receiver complete at
+`r percent(pop_funnel$complete_dropped[2], accuracy = 0.1)`: throwaways,
+grounding, and untargeted passes. Excluding them is a definition of the
+population, not attrition, and it is the same exclusion nflverse makes for
+`cp`. The `r pop_funnel$dropped[3]` targeted receivers who are not tracked
+complete at `r percent(pop_funnel$complete_dropped[3], accuracy = 0.1)`, the
+opposite skew. That is a measurement loss, small enough to state rather than
+correct. Every play that remains carries `cp`, so the stages and the benchmark
+are scored on the same rows.
+
+## 1.3 Derived predictors
 
 `prepare_model_frame()` in `R/evaluate.R` owns the response and three derived
 columns, so that every stage and the benchmark see identical inputs. The
@@ -189,7 +272,7 @@ An interception counts as an incompletion. This is how nflverse `cp` is defined,
 and matching it is what makes the benchmark comparison meaningful rather than a
 comparison of two different response variables.
 
-## 1.3 The scoring population
+## 1.4 The scoring population
 
 Every stage's log loss has to be computed on the same rows, or the *differences*
 between stages are not differences. `glm()` and `mgcv::gam()` default to
@@ -215,6 +298,7 @@ tibble(variable = model_vars()) |>
 #| label: incomplete-columns
 
 rep <- incomplete_report(mf)
+n_incomplete <- sum(!complete.cases(mf[model_vars()]))
 
 rep$by_column |>
   gt() |>
@@ -222,10 +306,9 @@ rep$by_column |>
   gt_theme_538(quiet = TRUE)
 ```
 
-Three plays, and the seven rows above are not seven independent gaps: the four
-`air_yards`-derived columns fail together on the same 3 plays, and the single
-missing `shotgun` / `home` / `qb_hit` is one of those 3 — the one play that
-found no play-by-play partner (`notes/decisions.md` §8.2).
+`r n_incomplete` plays in this population are missing a required variable.
+Before the targeted-receiver filter there were three (`notes/decisions.md`
+§9.1); none of them passes §1.2. The check stays as a tripwire.
 
 ```{r}
 #| label: incomplete-composition
@@ -235,17 +318,6 @@ rep$composition |>
   fmt_percent(columns = share, decimals = 1) |>
   gt_theme_538(quiet = TRUE)
 ```
-
-::: {.callout-note appearance="simple"}
-
-**Checked and immaterial.** The dropped block is 1 completion and 2
-incompletions. Three plays cannot be selected on anything, and the base rate
-moves by two parts in a million. This is the routine version of the check that
-rejected the `pass_arrived` anchor in `02_arrival_anchor.qmd` §1; it is run on
-every exclusion regardless of expected size, because the expensive failures are
-the ones that look routine.
-
-:::
 
 ```{r}
 #| label: scoring-population
@@ -275,8 +347,8 @@ tibble(
   gt_theme_538(quiet = TRUE)
 ```
 
-The base rate of $0.6529$ is the number stage 1 exists to reproduce, and the
-number every later stage has to beat.
+The base rate of `r sprintf("%.4f", mean(mf_complete$complete))` is the number
+stage 1 exists to reproduce, and the number every later stage has to beat.
 
 # 2. Resampling
 
@@ -350,7 +422,12 @@ summary(f2)
 ```{r}
 #| label: parametric-terms
 
-summary(f2)$p.table |>
+pt <- summary(f2)$p.table
+b <- function(term, col = "Estimate", digits = 2) {
+  sprintf(paste0("%.", digits, "f"), pt[term, col])
+}
+
+pt |>
   as.data.frame() |>
   rownames_to_column("term") |>
   as_tibble() |>
@@ -365,29 +442,38 @@ summary(f2)$p.table |>
 
 Three of these are worth reporting as findings rather than as controls.
 
-**`air_yards_zero` at $-0.87$ on the logit scale**, against an intercept of
-$1.00$: a throw at exactly zero air yards has roughly half the odds of
+**`air_yards_zero` at `r b("air_yards_zero")` on the logit scale**, against an
+intercept of `r b("(Intercept)")`: a throw at exactly zero air yards has
+`r sprintf("%.2f", exp(pt["air_yards_zero", "Estimate"]))` times the odds of
 completion of one nearby on either side. nflverse describes this indicator as a
 relic of its pre-tree models, and for a tree it is — a tree can split at exactly
-$0$. A penalized spline cannot; it smooths straight over a point mass of 1,093
-plays. Including it raised the effective degrees of freedom on `s(air_yards)`
-from $4.37$ to $7.67$ and improved deviance explained on a strictly smaller
-model.
+$0$. A penalized spline cannot; it smooths straight over a point mass of
+`r comma(sum(mf_complete$air_yards_zero))` plays. When the indicator was added
+during specification (`notes/decisions.md` §9.3), the effective degrees of
+freedom on `s(air_yards)` rose from $4.37$ to $7.67$ and deviance explained
+improved on a strictly smaller model.
 
-**`shotgun` at $-0.171$**, which is the opposite sign from the conventional
-wisdom that passing statistics are inflated out of shotgun. Both can be true:
-shotgun throws are systematically shorter, so the raw advantage is confounded by
-depth, and conditioning on depth inverts it. This coefficient was *not*
-estimable in the first fit, where `offense_formation` was also in the model — an
-EMPTY-backfield snap is essentially always from shotgun, so the two were aliased
-and the standard error on `shotgun` was $0.349$ rather than $0.047$.
+**`shotgun` at `r b("shotgun", digits = 3)`** (SE
+`r b("shotgun", "Std. Error", 3)`), which is the opposite sign from the
+conventional wisdom that passing statistics are inflated out of shotgun. Both
+can be true: shotgun throws are systematically shorter, so the raw advantage is
+confounded by depth, and conditioning on depth inverts it. This coefficient was
+*not* estimable in the first specification, which also included
+`offense_formation`: an empty-backfield snap is essentially always from shotgun,
+so the two were aliased and the standard error on `shotgun` was $0.349$.
 
-**`qb_hit` at $-0.88$** is the largest effect among the parametric terms. This
-vindicates treating it as a covariate rather than as an exclusion
+**`qb_hit` at `r b("qb_hit")`** is the largest effect among the parametric
+terms. This supports treating it as a covariate rather than as an exclusion
 (`notes/decisions.md` §7): it is a play-level flag that does not distinguish
 "hit during the throw" from "hit afterwards," so filtering on it would remove
-real passes and may itself select on outcome, while including it is informative
-and cheap to defend.
+real passes and may itself select on outcome.
+
+`pass_location` is kept at three levels. Against left, middle is
+`r b("pass_locationmiddle")` and right `r b("pass_locationright")`
+($p$ = `r b("pass_locationright", "Pr(>|z|)")`): middle differs from both
+sides, while left and right are not distinguishable in this population. The
+coding is kept by argument rather than revised on a $p$-value
+(`notes/decisions.md` §9.3).
 
 ## 3.2 Reading the smooths
 
@@ -398,7 +484,9 @@ the model but the relationship is linear.
 ```{r}
 #| label: smooth-terms
 
-summary(f2)$s.table |>
+st <- summary(f2)$s.table
+
+st |>
   as.data.frame() |>
   rownames_to_column("smooth") |>
   as_tibble() |>
@@ -409,18 +497,21 @@ summary(f2)$s.table |>
   gt_theme_538(quiet = TRUE)
 ```
 
-`s(dist_to_sticks)` comes back essentially null: `edf` $1.01$, $p = 0.10$. The
-motivation was sound — additive smooths in `air_yards` and `yards_to_go` cannot
-represent their difference, which is an interaction, and a 3-yard throw on
-3rd-and-2 is a different play from a 3-yard throw on 3rd-and-15 — but the data
-does not support it. Conditional on depth, whether the throw reaches the line to
+`s(dist_to_sticks)` comes back weak: `edf`
+`r sprintf("%.2f", st["s(dist_to_sticks)", "edf"])`,
+$p$ = `r sprintf("%.2f", st["s(dist_to_sticks)", "p-value"])`. The motivation was
+sound — additive smooths in `air_yards` and `yards_to_go` cannot represent their
+difference, which is an interaction, and a 3-yard throw on 3rd-and-2 is a
+different play from a 3-yard throw on 3rd-and-15 — but the data give it little
+support. Conditional on depth, whether the throw reaches the line to
 gain barely affects whether it is caught. In hindsight this is sensible: the
 sticks govern *play calling*, which is upstream of the throw rather than a
 property of it.
 
 **It stays in the model anyway.** Stage 2 exists to be a strong baseline, and
 pruning a baseline on in-sample significance is what makes a nested comparison
-look tuned. It costs one effective degree of freedom out of 17,074 observations.
+look tuned. It costs one effective degree of freedom out of
+`r comma(nrow(mf_complete))` observations.
 It also spans the `yards_to_go` direction, so dropping it would remove that
 variable from the model entirely.
 
@@ -428,13 +519,19 @@ variable from the model entirely.
 #| label: gam-check
 
 gam.check(f2)
+kc <- k.check(f2)
 ```
 
 The basis dimension check is the part to read. `k-index` below $1$ with a small
 $p$-value suggests the basis is too small — *especially* when `edf` sits close to
-`k'`. Here the largest `edf` is $7.67$ against `k'` of $9$, and the penalty is
-choosing well short of the available flexibility everywhere else, so the default
-basis is adequate.
+`k'`. The largest `edf` is `r sprintf("%.2f", max(kc[, "edf"]))` against `k'` of
+`r max(kc[, "k'"])`, and the penalty chooses well short of the available
+flexibility elsewhere. `s(number_of_pass_rushers)` reports a low `k-index`, but
+its `edf` is `r sprintf("%.2f", kc["s(number_of_pass_rushers)", "edf"])` of a
+possible `r kc["s(number_of_pass_rushers)", "k'"]`: the penalty chose a straight
+line, so a larger basis would not change the fit. The test orders observations by
+the covariate and compares neighbouring residuals, which is unreliable for a
+variable with six distinct values. The default bases are adequate.
 
 Do not over-read the residual plots. Deviance residuals from a binomial fit on a
 binary response always separate into two arcs; that is a property of binary data
@@ -483,7 +580,8 @@ tibble(
 
 ::: {.callout-note appearance="simple"}
 
-**Deviance explained of 9.85% is the expected magnitude, not a problem.**
+**Deviance explained of `r percent(sm$dev.expl, accuracy = 0.01)` is the
+expected magnitude, not a problem.**
 Completion is a genuinely noisy outcome and play-by-play information explains
 little of it. Two consequences worth stating up front.
 
@@ -512,6 +610,9 @@ anything.
 #| label: cv-predict
 
 preds <- cv_predict_all(mf_complete, folds, verbose = FALSE)
+pred_mean <- tapply(preds$.pred, preds$model, mean)
+s1_range <- range(preds$.pred[preds$model == "1. intercept"])
+s2_range <- range(preds$.pred[preds$model == "2. play-by-play"])
 
 preds |>
   group_by(model) |>
@@ -533,15 +634,19 @@ preds |>
 
 Two things in that table are checks rather than description.
 
-**The mean prediction should sit on the base rate.** It does, for both stages, to
-four decimal places against $0.6529$. A visible gap here would be the first sign
-of a calibration problem, and it shows up before any metric is computed.
+**The mean prediction should sit on the base rate.** It does for both stages:
+`r sprintf("%.4f", pred_mean[["1. intercept"]])` and
+`r sprintf("%.4f", pred_mean[["2. play-by-play"]])` against
+`r sprintf("%.4f", mean(mf_complete$complete))`. A visible gap here would be the
+first sign of a calibration problem, and it shows up before any metric is
+computed.
 
 **Stage 1's spread is the fold-to-fold variation in the base rate itself**, not a
 model learning anything: each of its 17 distinct predictions is the completion
-rate of the *other* 16 weeks. The range $0.650$ to $0.655$ is therefore a useful
-incidental measurement — week-to-week completion rate in 2018 varied by about
-half a percentage point around its mean.
+rate of the *other* 16 weeks. The range,
+`r sprintf("%.3f", s1_range[1])` to `r sprintf("%.3f", s1_range[2])`, is therefore
+a useful incidental measurement: the leave-one-week-out completion rate in 2018
+varied by `r sprintf("%.1f", 100 * diff(s1_range))` percentage points.
 
 ```{r}
 #| label: prediction-distributions
@@ -584,29 +689,9 @@ p_dist
 
 A model that discriminates has to *spread out*: pushing predictions away from the
 base rate is how it earns a lower log loss, and being wrong while spread out is
-how it earns a worse one. Stage 2 spans roughly $0.07$ to $0.92$. Whether that
-spread is justified is the question §5 and §6 answer.
-
-```{r}
-#| label: observed-vs-predicted-band
-
-# A coarse look ahead at calibration: within deciles of prediction, does
-# the observed rate track? Section 6 does this properly, with intervals.
-preds |>
-  filter(model == "2. play-by-play") |>
-  mutate(bin = ntile(.pred, 10)) |>
-  group_by(bin) |>
-  summarize(
-    n = n(),
-    mean_pred = mean(.pred),
-    obs_rate = mean(complete),
-    .groups = "drop"
-  ) |>
-  mutate(gap = obs_rate - mean_pred) |>
-  gt() |>
-  fmt_number(columns = c(mean_pred, obs_rate, gap), decimals = 3) |>
-  gt_theme_538(quiet = TRUE)
-```
+how it earns a worse one. Stage 2 spans `r sprintf("%.2f", s2_range[1])` to
+`r sprintf("%.2f", s2_range[2])`. Whether that spread is justified is the
+question §5–§7 answer.
 
 # 5. Scoring
 
@@ -659,6 +744,7 @@ scores <- preds |>
     vs_entropy = log_loss - h_ybar,
     vs_intercept = log_loss - log_loss[model == "1. intercept"]
   )
+ll <- set_names(scores$log_loss, scores$model)
 
 stopifnot(
   scores$log_loss[scores$model == "1. intercept"] >= h_ybar,
@@ -681,15 +767,20 @@ scores |>
   gt_theme_538(quiet = TRUE)
 ```
 
-**Stage 1 sits $0.0001$ nats above the floor**, which is the size the argument
-above predicts: the 17 fold means span only $0.650$ to $0.655$ (§4), so the
-penalty for predicting each week with the other weeks' rate is tiny but cannot be
-negative.
+**Stage 1 sits `r sprintf("%.5f", ll[["1. intercept"]] - h_ybar)` nats above the
+floor**, which is the size the argument above predicts: the 17 fold means span
+only `r sprintf("%.3f", s1_range[1])` to `r sprintf("%.3f", s1_range[2])` (§4),
+so the penalty for predicting each week with the other weeks' rate is tiny but
+cannot be negative.
 
-**Stage 2 improves on it by $0.062$ nats.** As a share of the stage 1 loss that
-is about $9.6\%$, against $9.85\%$ deviance explained in-sample (§3.3). The
-out-of-fold figure being only slightly smaller is the expected direction, and its
-small size says the stage 2 smooths are not overfitting at this sample size.
+**Stage 2 improves on it by
+`r sprintf("%.4f", ll[["1. intercept"]] - ll[["2. play-by-play"]])` nats.** As a
+share of the stage 1 loss that is
+`r percent(1 - ll[["2. play-by-play"]] / ll[["1. intercept"]], accuracy = 0.1)`,
+against `r percent(sm$dev.expl, accuracy = 0.01)` deviance explained in-sample
+(§3.3). The out-of-fold figure being only slightly smaller is the expected
+direction, and its small size says the stage 2 smooths are not overfitting at
+this sample size.
 
 This is the number stages 3 and 4 have to improve on. Whether a difference of a
 given size is distinguishable from fold-to-fold noise is a question for the
@@ -776,27 +867,386 @@ deltas |>
   fmt_number(columns = c(se_boot, se_cluster, se_iid), decimals = 5) |>
   fmt_number(columns = design_effect, decimals = 2) |>
   gt_theme_538(quiet = TRUE)
+
+dg <- deltas[deltas$cluster == "game_id", ]
+dw <- deltas[deltas$cluster == "week", ]
+deff <- function(d) sprintf("%.2f", (d$se_cluster / d$se_iid)^2)
 ```
 
-**Stage 2 improves on stage 1 by $0.062$ nats, 95% interval
-$[-0.0673, -0.0570]$ clustering by game.** The interval is about 24 standard
-errors from zero, so the baseline's improvement over the base rate is not in
-question.
+**Stage 2 improves on stage 1 by `r sprintf("%.4f", -dg$estimate)` nats, 95%
+interval [`r sprintf("%.4f", dg$conf_low)`, `r sprintf("%.4f", dg$conf_high)`]
+clustering by game.** The interval is about
+`r round(-dg$estimate / dg$se_boot)` standard errors from zero, so the
+baseline's improvement over the base rate is not in question.
 
-**The bootstrap is consistent with the analytic standard error** to three
-significant figures under game clustering ($0.00261$ against $0.00261$), which is
-the check that the resampling code is right.
+**The bootstrap agrees with the analytic standard error** under game clustering
+(`r sprintf("%.5f", dg$se_boot)` against `r sprintf("%.5f", dg$se_cluster)`),
+which is the check that the resampling code is right.
 
-**Clustering barely matters for this comparison.** The design effect is $0.99$
-for games: the paired differences show no detectable within-game correlation,
-because game-level factors that make plays harder or easier affect both stages'
-losses alike and cancel in $d_i$. The week figure ($0.89$) is within the noise of
-a standard error estimated from 17 clusters, whose own relative error is roughly
-$1/\sqrt{2(G-1)} \approx 18\%$; it does not indicate that weeks behave
-differently from games.
+**Clustering barely matters for this comparison.** The design effect is
+`r deff(dg)` for games: the paired differences show no detectable within-game
+correlation, because game-level factors that make plays harder or easier affect
+both stages' losses alike and cancel in $d_i$. The week figure (`r deff(dw)`) is
+within the noise of a standard error estimated from 17 clusters, whose own
+relative error is roughly $1/\sqrt{2(G-1)} \approx 18\%$; it does not indicate
+that weeks behave differently from games.
 
 This need not hold for stages 3 and 4. Coverage features are partly team-level,
 so their improvements over stage 2 could be concentrated in particular games,
 and game clustering is retained so the interval would widen if they are.
 
-Sections 7 and 8 — calibration and the `cp` benchmark — follow.
+# 7. Calibration
+
+## 7.1 Measures
+
+Log loss rewards calibration and discrimination together. Calibration asks the
+first question on its own: when the model says 70%, do 70% of those passes
+complete? Three summary measures (Van Calster et al., 2019):
+
+$$
+\text{CITL} = \bar y - \bar{\hat p},
+$$
+
+$$
+\operatorname{logit} P(y_i = 1) = a + \operatorname{logit}\hat p_i,
+\qquad
+\operatorname{logit} P(y_i = 1) = a' + b \operatorname{logit}\hat p_i .
+$$
+
+- **Calibration-in-the-large** (CITL) is the gap between the observed and
+  predicted rates; positive means the model underpredicts.
+- **The calibration intercept** $a$ is the same gap on the logit scale, with the
+  slope fixed at 1.
+- **The calibration slope** $b$ is 1 for a calibrated model. Below 1, the
+  predictions are too extreme (too close to 0 and 1); above 1, too timid.
+
+Intervals are game-cluster bootstrap percentiles, as in §6, holding the
+predictions fixed and refitting the two recalibration models on each draw.
+
+The curves show the same thing visually: a smoothed calibration curve (a
+binomial GAM of the outcome on $\operatorname{logit}\hat p$, with a pointwise
+95% band) and observed rates in 20 equal-count bins of the predictions, each
+holding about 830 plays.
+
+Stage 1 is omitted: its predictions span
+`r sprintf("%.1f", 100 * diff(s1_range))` percentage points, so its slope is not
+meaningful, and its CITL is zero by construction.
+
+nflverse `cp` is calibrated alongside stage 2, as a fixed external set of
+predictions. It is not refit or recalibrated (§8).
+
+```{r}
+#| label: add-cp
+
+preds_all <- bind_rows(
+  preds,
+  mf_complete |>
+    transmute(
+      game_id,
+      play_id,
+      week,
+      complete,
+      .pred = cp,
+      n_train = NA_integer_,
+      model = "cp"
+    )
+)
+
+calib_models <- c("2. play-by-play", "cp")
+```
+
+## 7.2 Overall
+
+```{r}
+#| label: calibration-summary
+
+calib <- map(calib_models, \(m) {
+  d <- filter(preds_all, model == m)
+  calibration_summary(d$complete, d$.pred, cluster = d$game_id) |>
+    mutate(model = m)
+}) |>
+  list_rbind()
+
+# Adding 0 turns a rounded -0 into 0, so it prints without a sign.
+cs <- function(m, stat, col = "estimate", digits = 3) {
+  x <- calib[[col]][calib$model == m & calib$stat == stat]
+  sprintf(paste0("%.", digits, "f"), round(x, digits) + 0)
+}
+
+calib |>
+  select(model, stat, estimate, conf_low, conf_high) |>
+  gt(groupname_col = "model") |>
+  tab_header(
+    title = "Calibration, out-of-fold",
+    subtitle = "Game-cluster bootstrap, 2,000 draws, 95% percentile interval"
+  ) |>
+  fmt_number(columns = c(estimate, conf_low, conf_high), decimals = 3) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: calibration-curves
+#| fig-height: 5
+
+curves <- map(calib_models, \(m) {
+  d <- filter(preds_all, model == m)
+  cc <- calibration_curve(d$complete, d$.pred)
+  list(
+    bins = mutate(cc$bins, model = m),
+    smooth = mutate(cc$smooth, model = m)
+  )
+})
+cal_bins <- list_rbind(map(curves, "bins"))
+cal_smooth <- list_rbind(map(curves, "smooth"))
+
+p_cal <- ggplot() +
+  geom_abline(linetype = "dashed", linewidth = 0.4, colour = "grey50") +
+  geom_ribbon(
+    data = cal_smooth,
+    aes(pred, ymin = low, ymax = high),
+    fill = "grey70",
+    alpha = 0.5
+  ) +
+  geom_line(data = cal_smooth, aes(pred, obs), linewidth = 0.6) +
+  geom_pointrange(
+    data = cal_bins,
+    aes(
+      mean_pred,
+      obs_rate,
+      ymin = obs_rate - 1.96 * se,
+      ymax = obs_rate + 1.96 * se
+    ),
+    size = 0.15,
+    colour = "#1f4fd8"
+  ) +
+  facet_wrap(~model) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Calibration of out-of-fold predictions",
+    subtitle = "Smoothed curve with 95% band; points are 20 equal-count bins",
+    x = "predicted P(complete)",
+    y = "observed completion rate"
+  ) +
+  theme_minimal()
+
+ggsave(
+  here("figs", "week06", "calibration.png"),
+  p_cal,
+  width = 8,
+  height = 4.5,
+  dpi = 200
+)
+
+p_cal
+```
+
+**Stage 2 is well calibrated overall.** CITL is
+`r cs("2. play-by-play", "citl")`
+[`r cs("2. play-by-play", "citl", "conf_low")`,
+`r cs("2. play-by-play", "citl", "conf_high")`] and the slope
+`r cs("2. play-by-play", "slope")`
+[`r cs("2. play-by-play", "slope", "conf_low")`,
+`r cs("2. play-by-play", "slope", "conf_high")`]. A slope this close to 1 out of
+fold says the spread of stage 2's predictions is earned rather than overfit.
+
+**`cp` is also well calibrated on this population**: CITL `r cs("cp", "citl")`
+[`r cs("cp", "citl", "conf_low")`, `r cs("cp", "citl", "conf_high")`], slope
+`r cs("cp", "slope")` [`r cs("cp", "slope", "conf_low")`,
+`r cs("cp", "slope", "conf_high")`]. Partly in-sample for 2018, it would be
+surprising if it were not.
+
+## 7.3 Within air-yards buckets
+
+Overall calibration can hide offsetting errors in subgroups. Depth is the
+natural first split, since it is the strongest predictor and since tracking
+features will be reported against it. Bucket edges are fixed in advance:
+at or behind the line, short (1–9), intermediate (10–19), and deep (20+). The
+"$\le 0$" bucket will empty once the beyond-the-line-of-scrimmage filter is
+applied. Separation buckets follow once stage 3 exists.
+
+```{r}
+#| label: calibration-buckets
+
+with_bucket <- preds_all |>
+  filter(model %in% calib_models) |>
+  left_join(
+    select(mf_complete, game_id, play_id, air_yards),
+    by = c("game_id", "play_id")
+  ) |>
+  mutate(bucket = air_yards_bucket(air_yards))
+
+stopifnot(!anyNA(with_bucket$bucket))
+
+by_bucket <- with_bucket |>
+  group_by(model, bucket) |>
+  group_modify(\(d, k) {
+    calibration_summary(d$complete, d$.pred, cluster = d$game_id, B = 1000) |>
+      mutate(observed = mean(d$complete), predicted = mean(d$.pred))
+  }) |>
+  ungroup()
+
+ci_txt <- function(est, lo, hi) sprintf("%.3f [%.3f, %.3f]", est, lo, hi)
+
+by_bucket |>
+  filter(stat != "intercept") |>
+  mutate(value = ci_txt(estimate, conf_low, conf_high)) |>
+  select(model, bucket, n, observed, predicted, stat, value) |>
+  pivot_wider(names_from = stat, values_from = value) |>
+  gt(groupname_col = "model") |>
+  tab_header(
+    title = "Calibration by air-yards bucket",
+    subtitle = "Game-cluster bootstrap, 1,000 draws, 95% percentile interval"
+  ) |>
+  fmt_number(columns = n, decimals = 0) |>
+  fmt_percent(columns = c(observed, predicted), decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+
+bk <- function(m, b, stat, col = "estimate") {
+  by_bucket[[col]][
+    by_bucket$model == m & by_bucket$bucket == b & by_bucket$stat == stat
+  ]
+}
+```
+
+```{r}
+#| label: calibration-bucket-curves
+#| fig-height: 5.5
+
+bucket_bins <- with_bucket |>
+  group_by(model, bucket) |>
+  mutate(bin = ntile(.pred, 10)) |>
+  group_by(model, bucket, bin) |>
+  summarize(
+    n = n(),
+    mean_pred = mean(.pred),
+    obs_rate = mean(complete),
+    .groups = "drop"
+  ) |>
+  mutate(se = sqrt(obs_rate * (1 - obs_rate) / n))
+
+p_cal_bucket <- ggplot(bucket_bins, aes(mean_pred, obs_rate)) +
+  geom_abline(linetype = "dashed", linewidth = 0.4, colour = "grey50") +
+  geom_pointrange(
+    aes(ymin = obs_rate - 1.96 * se, ymax = obs_rate + 1.96 * se),
+    size = 0.15,
+    colour = "#1f4fd8"
+  ) +
+  facet_grid(model ~ bucket) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Calibration within air-yards buckets",
+    subtitle = "10 equal-count bins per bucket",
+    x = "predicted P(complete)",
+    y = "observed completion rate"
+  ) +
+  theme_minimal()
+
+ggsave(
+  here("figs", "week06", "calibration_by_air_yards.png"),
+  p_cal_bucket,
+  width = 9,
+  height = 5.5,
+  dpi = 200
+)
+
+p_cal_bucket
+```
+
+**Calibration-in-the-large holds in every bucket**, for both stage 2 and `cp`:
+each CITL interval contains zero.
+
+**The slope does not hold for stage 2 on deep throws.** Within the 20+ bucket
+(`r comma(bk("2. play-by-play", "20+", "citl", "n"))` plays) the stage 2 slope is
+`r sprintf("%.2f", bk("2. play-by-play", "20+", "slope"))`
+[`r sprintf("%.2f", bk("2. play-by-play", "20+", "slope", "conf_low"))`,
+`r sprintf("%.2f", bk("2. play-by-play", "20+", "slope", "conf_high"))`]:
+among deep throws, its predictions are spread considerably more than the
+outcomes support. `cp`'s slope in the same bucket is
+`r sprintf("%.2f", bk("cp", "20+", "slope"))`
+[`r sprintf("%.2f", bk("cp", "20+", "slope", "conf_low"))`,
+`r sprintf("%.2f", bk("cp", "20+", "slope", "conf_high"))`]. In the other
+buckets both slopes are consistent with 1.
+
+Stage 2 is additive, so within the deep bucket its predictions still move with
+depth, field position, and the other terms at the strength those terms have
+across all throws. The slope says that on deep throws those effects are weaker
+than the model assumes. `cp`, which can represent interactions, does not show
+the same pattern, which is consistent with part of the §8 gap coming from deep
+throws. Two consequences:
+
+- Deep throws are where stage 2 is weakest, so they are where stages 3 and 4
+  have the most room; the stage 3–4 comparison should be reported by depth as
+  well as overall.
+- An interaction between depth and the other stage 2 terms would likely fix
+  this, but adding one now would change the baseline that geometry is measured
+  against. It is recorded as an open question rather than acted on
+  (`notes/decisions.md` §7).
+
+# 8. The `cp` benchmark
+
+nflverse `cp` is scored as a fixed external set of predictions on the same rows
+as the stages. It is not a clean out-of-sample rival: nflfastR's model was
+trained on seasons including 2018, uses charted air yards, and is a gradient
+boosted model trained on many seasons (`notes/decisions.md` §8.6). The project's
+claim is that tracking geometry adds information beyond play-by-play — measured
+by stages 3 and 4 against stage 2 — not that the project beats `cp`. The
+benchmark places stage 2 relative to the field standard.
+
+```{r}
+#| label: cp-benchmark
+
+ll_all <- preds_all |>
+  group_by(model) |>
+  summarize(n = n(), log_loss = log_loss(complete, .pred), .groups = "drop")
+
+cp_deltas <- bind_rows(
+  paired_delta(preds_all, "cp", "2. play-by-play", cluster = "game_id"),
+  paired_delta(preds_all, "cp", "2. play-by-play", cluster = "week"),
+  paired_delta(preds_all, "1. intercept", "cp", cluster = "game_id")
+)
+
+ll_all |>
+  gt() |>
+  tab_header(title = "Out-of-fold log loss, stages and benchmark") |>
+  fmt_number(columns = log_loss, decimals = 4) |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+
+cp_deltas |>
+  select(reference, model, cluster, estimate, conf_low, conf_high, se_boot) |>
+  gt() |>
+  tab_header(
+    title = "Paired differences in log loss (model minus reference)",
+    subtitle = "Cluster bootstrap, 10,000 draws, 95% percentile interval"
+  ) |>
+  fmt_number(columns = c(estimate, conf_low, conf_high), decimals = 4) |>
+  fmt_number(columns = se_boot, decimals = 5) |>
+  gt_theme_538(quiet = TRUE)
+
+d2cp <- cp_deltas[
+  cp_deltas$model == "2. play-by-play" &
+    cp_deltas$cluster == "game_id",
+]
+dcp1 <- cp_deltas[cp_deltas$model == "cp", ]
+```
+
+**`cp` beats stage 2 by `r sprintf("%.4f", d2cp$estimate)` nats**, 95% interval
+[`r sprintf("%.4f", d2cp$conf_low)`, `r sprintf("%.4f", d2cp$conf_high)`] by
+game. Against the intercept, `cp` gains `r sprintf("%.4f", -dcp1$estimate)`
+nats and stage 2 `r sprintf("%.4f", -dg$estimate)`, so stage 2 captures
+`r percent(dg$estimate / dcp1$estimate, accuracy = 1)` of `cp`'s improvement
+over the base rate.
+
+Both are well calibrated (§7.2), so the gap is in discrimination: `cp` ranks
+plays better. Several plausible sources, none separable here: its model class
+can represent interactions that stage 2's additive smooths cannot, it is trained
+on far more plays, and 2018 is partly in its training data.
+
+The gap is the reference point for stages 3 and 4. If coverage geometry closes
+it, tracking matches the field standard with a simpler model class; if
+geometry's improvement over stage 2 exceeds it, tracking adds more than the
+field-standard play-by-play model does.

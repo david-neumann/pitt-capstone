@@ -20,6 +20,10 @@
 #   pointwise_log_loss()    per-play log loss
 #   log_loss()              mean log loss
 #   paired_delta()          paired difference with a cluster bootstrap
+#   calibration_stats()     calibration-in-the-large, intercept, slope
+#   calibration_summary()   the same with a cluster bootstrap interval
+#   calibration_curve()     binned and smoothed reliability curves
+#   air_yards_bucket()      subgroup buckets for calibration
 #
 # mgcv must be attached (library(mgcv)) before fitting, because the spec
 # formulas use bare s().
@@ -404,6 +408,15 @@ fit_full <- function(df, spec) {
 #' @param p Predicted probability that y = 1, strictly inside (0, 1).
 #' @return Numeric vector the length of `y`.
 pointwise_log_loss <- function(y, p) {
+  assert_probs(y, p)
+
+  -(y * log(p) + (1 - y) * log1p(-p))
+}
+
+
+#' Fail unless `y` is a complete 0/1 vector and `p` a matching vector of
+#' probabilities strictly inside (0, 1)
+assert_probs <- function(y, p) {
   stopifnot(
     length(y) == length(p),
     length(y) > 0,
@@ -412,8 +425,7 @@ pointwise_log_loss <- function(y, p) {
     all(y %in% c(0, 1)),
     all(p > 0 & p < 1)
   )
-
-  -(y * log(p) + (1 - y) * log1p(-p))
+  invisible(TRUE)
 }
 
 
@@ -523,5 +535,177 @@ paired_delta <- function(
     se_boot = stats::sd(draws),
     se_cluster = sqrt(n_g / (n_g - 1) * sum((sums - sizes * estimate)^2)) / n,
     se_iid = stats::sd(d) / sqrt(n)
+  )
+}
+
+
+# ---- calibration -------------------------------------------------
+
+#' Logistic recalibration statistics
+#'
+#' - `citl`: calibration-in-the-large, mean(y) - mean(p). Positive when
+#'   the model underpredicts.
+#' - `intercept`: a in logit P(y = 1) = a + logit(p), with the slope fixed
+#'   at 1. Zero when calibrated in the large; same sign as `citl`.
+#' - `slope`: b in logit P(y = 1) = a + b logit(p). One when calibrated;
+#'   below one when predictions are too extreme, above one when too
+#'   timid.
+#'
+#' See Van Calster et al. (2019).
+#'
+#' @inheritParams pointwise_log_loss
+#' @return Named numeric vector: `citl`, `intercept`, `slope`.
+calibration_stats <- function(y, p) {
+  assert_probs(y, p)
+  lp <- stats::qlogis(p)
+
+  fit_int <- stats::glm.fit(
+    x = matrix(1, nrow = length(y)),
+    y = y,
+    offset = lp,
+    family = stats::binomial()
+  )
+  fit_slope <- stats::glm.fit(
+    x = cbind(1, lp),
+    y = y,
+    family = stats::binomial()
+  )
+  stopifnot(fit_int$converged, fit_slope$converged)
+
+  c(
+    citl = mean(y) - mean(p),
+    intercept = fit_int$coefficients[[1]],
+    slope = fit_slope$coefficients[[2]]
+  )
+}
+
+
+#' Calibration statistics with a cluster bootstrap interval
+#'
+#' Resamples whole clusters with replacement and refits the recalibration
+#' models on each draw; the interval is the percentile interval. As in
+#' paired_delta(), predictions are held fixed.
+#'
+#' @inheritParams pointwise_log_loss
+#' @param cluster Cluster label for each play, the length of `y`.
+#' @param B Bootstrap resamples.
+#' @param level Interval coverage.
+#' @param seed RNG seed, applied locally.
+#' @return A tibble with one row per statistic: `stat`, `estimate`,
+#'   `conf_low`, `conf_high`, `n`, `n_clusters`.
+calibration_summary <- function(
+  y,
+  p,
+  cluster,
+  B = 2000,
+  level = 0.95,
+  seed = 1961
+) {
+  stopifnot(
+    length(cluster) == length(y),
+    !anyNA(cluster),
+    B >= 1000,
+    level > 0 && level < 1
+  )
+
+  est <- calibration_stats(y, p)
+  rows <- split(seq_along(y), cluster)
+  n_g <- length(rows)
+
+  draws <- withr::with_seed(seed, {
+    vapply(
+      seq_len(B),
+      \(b) {
+        i <- unlist(rows[sample.int(n_g, n_g, replace = TRUE)], use.names = FALSE)
+        calibration_stats(y[i], p[i])
+      },
+      numeric(3)
+    )
+  })
+
+  alpha <- 1 - level
+  ci <- apply(draws, 1, stats::quantile, probs = c(alpha / 2, 1 - alpha / 2))
+
+  tibble::tibble(
+    stat = names(est),
+    estimate = unname(est),
+    conf_low = unname(ci[1, ]),
+    conf_high = unname(ci[2, ]),
+    n = length(y),
+    n_clusters = n_g
+  )
+}
+
+
+#' Binned and smoothed calibration curves
+#'
+#' Bins have equal counts of plays, so each point carries similar
+#' precision. The smooth is a binomial GAM of `y` on logit(p), evaluated
+#' between the 0.5th and 99.5th percentiles of `p`, with a pointwise
+#' band that ignores clustering.
+#'
+#' @inheritParams pointwise_log_loss
+#' @param n_bins Number of equal-count bins.
+#' @param n_grid Points at which the smooth is evaluated.
+#' @param level Band coverage.
+#' @return list(bins = tibble of `bin`, `n`, `mean_pred`, `obs_rate`,
+#'   `se`; smooth = tibble of `pred`, `obs`, `low`, `high`).
+calibration_curve <- function(y, p, n_bins = 20, n_grid = 200, level = 0.95) {
+  assert_probs(y, p)
+
+  bins <- tibble::tibble(y = y, p = p) |>
+    dplyr::mutate(bin = dplyr::ntile(p, n_bins)) |>
+    dplyr::group_by(bin) |>
+    dplyr::summarize(
+      n = dplyr::n(),
+      mean_pred = mean(p),
+      obs_rate = mean(y),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(se = sqrt(obs_rate * (1 - obs_rate) / n))
+
+  fit <- mgcv::gam(
+    y ~ s(lp),
+    data = data.frame(y = y, lp = stats::qlogis(p)),
+    family = stats::binomial(),
+    method = "REML"
+  )
+
+  grid <- seq(
+    stats::quantile(p, 0.005, names = FALSE),
+    stats::quantile(p, 0.995, names = FALSE),
+    length.out = n_grid
+  )
+  pr <- stats::predict(
+    fit,
+    newdata = data.frame(lp = stats::qlogis(grid)),
+    se.fit = TRUE
+  )
+  z <- stats::qnorm(1 - (1 - level) / 2)
+
+  smooth <- tibble::tibble(
+    pred = grid,
+    obs = stats::plogis(pr$fit),
+    low = stats::plogis(pr$fit - z * pr$se.fit),
+    high = stats::plogis(pr$fit + z * pr$se.fit)
+  )
+
+  list(bins = bins, smooth = smooth)
+}
+
+
+#' Air-yards buckets for subgroup calibration
+#'
+#' Fixed football-meaningful edges: at or behind the line, short,
+#' intermediate, deep.
+#'
+#' @param air_yards Numeric vector.
+#' @return Factor with levels "<= 0", "1-9", "10-19", "20+".
+air_yards_bucket <- function(air_yards) {
+  cut(
+    air_yards,
+    breaks = c(-Inf, 0, 9, 19, Inf),
+    labels = c("<= 0", "1-9", "10-19", "20+"),
+    right = TRUE
   )
 }
