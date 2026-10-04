@@ -1,21 +1,14 @@
 # R/sample_rules.R -----------------------------------------------------
-# The project's sample definition, in one place.
-#
-# Every exclusion decision in the project is a line in this file.
-# scripts/04_build_sample.R applies it; analysis/01_eda.qmd only reports
-# what it did. Nothing here scans the tracking data — the inputs are all
-# measured facts from data/processed/play_index.parquet.
-#
-# Defines functions and constants only. No library() calls.
+# Sample definition: exclusion flags, the rules that combine them, and
+# funnel reporting. Applied by scripts/04_build_sample.R. Inputs are
+# measured columns from data/processed/play_index.parquet and
+# plays.parquet.
 
 source(here::here("R", "coverage.R"))
 
 # ---- flag vocabulary -------------------------------------------------
 
 #' Human-readable label for every exclusion flag
-#'
-#' Named by flag so the funnel labels can't drift out of alignment with
-#' the flags, which a positional vector allows.
 FLAG_LABELS <- c(
   keep_live_play = "has offense_formation (not a fake/aborted snap)",
   keep_snap = "has a ball_snap event",
@@ -34,11 +27,14 @@ FLAG_LABELS <- c(
 
 #' Whether a flag defines the population or screens for data quality
 #'
-#' Population filters describe the question: which plays are we asking
-#' about at all. Quality filters describe the data's ability to answer it.
-#' Only the second block is measurement loss, and it is only interpretable
-#' as such when it runs *after* the population is defined — otherwise its
-#' counts are inflated by plays that were never in scope.
+#' Population flags define which plays are in scope; quality flags
+#' identify in-scope plays that cannot be measured. Rules list population
+#' flags first so that each quality step's funnel count is measurement
+#' loss only.
+#'
+#' `keep_arrival` is a diagnostic only and must not appear in a rule: the
+#' `pass_arrived` event it tests is missing far more often on
+#' incompletions (notes/decisions.md §4.8, §6.1).
 FLAG_GROUP <- c(
   keep_live_play = "population",
   keep_snap = "population",
@@ -57,17 +53,11 @@ FLAG_GROUP <- c(
 
 stopifnot(setequal(names(FLAG_LABELS), names(FLAG_GROUP)))
 
-# ---- the two candidate rules -----------------------------------------
-# Population block first, then quality. Conjunction is order-independent,
-# so the surviving count is identical under any ordering; what the
-# ordering buys is that each quality step's `dropped` reads as "plays I
-# wanted but cannot measure".
+# ---- rules -----------------------------------------------------------
 
-#' The adopted rule: kinematic exclusion scoped to the measurement window
+#' Adopted rule: kinematic defects count only between snap and throw
 #'
-#' A play is dropped for a bad frame only when that frame falls between
-#' the snap and the throw. See notes/decisions.md; the majority of
-#' defective rows land after the throw.
+#' See notes/decisions.md §4.2.
 SCOPED_FLAGS <- c(
   # population
   "keep_live_play",
@@ -81,10 +71,11 @@ SCOPED_FLAGS <- c(
   "keep_clean_window"
 )
 
-#' The whole-play alternative, retained only to quantify what the scoped
-#' rule costs. Not used to define the analytical sample. Differs from
-#' SCOPED_FLAGS at exactly two steps: the throw anchor (3) and the
-#' kinematic scope (8).
+#' Whole-play alternative, used only to report what the scoped rule
+#' changes
+#'
+#' Differs from SCOPED_FLAGS at steps 3 (throw anchor) and 8 (kinematic
+#' scope).
 CONSERVATIVE_FLAGS <- c(
   "keep_live_play",
   "keep_snap",
@@ -96,8 +87,7 @@ CONSERVATIVE_FLAGS <- c(
   "keep_clean_kin"
 )
 
-#' The project's sample definition. Changing this one line changes the
-#' sample everywhere downstream.
+#' The rule that defines the analytical sample
 SAMPLE_RULE <- SCOPED_FLAGS
 
 stopifnot(length(SCOPED_FLAGS) == length(CONSERVATIVE_FLAGS))
@@ -106,13 +96,13 @@ stopifnot(length(SCOPED_FLAGS) == length(CONSERVATIVE_FLAGS))
 
 #' Attach every exclusion flag to the play table
 #'
-#' Flags are computed for all plays whether or not the current rule uses
-#' them, so a question-specific framing (coverage-conditional, targeted
-#' receiver only) is a choice of flag subset rather than a rebuild.
+#' All flags are computed whether or not SAMPLE_RULE uses them.
 #'
 #' @param plays data/processed/plays.parquet
 #' @param play_index data/processed/play_index.parquet
 #' @param coverages data/processed/coverages_week1.parquet, or NULL
+#' @return One row per play with the selected play columns, the play
+#'   index, `coverage`, `coverage_class`, and every `keep_*` flag.
 add_sample_flags <- function(plays, play_index, coverages = NULL) {
   df <- plays |>
     dplyr::select(
@@ -172,7 +162,7 @@ add_sample_flags <- function(plays, play_index, coverages = NULL) {
 
 #' Logical mask for the conjunction of a set of flags
 #'
-#' coalesce() stops a stray NA flag from poisoning every later step.
+#' NA flags are treated as FALSE.
 apply_flags <- function(df, flags) {
   purrr::reduce(
     flags,
@@ -181,13 +171,9 @@ apply_flags <- function(df, flags) {
   )
 }
 
-#' Marginal failure count for every flag, independent of rule ordering
+#' Unconditional failure count for every flag
 #'
-#' The funnel's `dropped` is conditional on the preceding steps. These are
-#' the unconditional counts: how many plays fail each criterion on its
-#' own. Both are worth reporting, and conflating them is easy — the
-#' missing-LOS block is larger than the number of plays the funnel
-#' attributes to keep_los.
+#' Unlike funnel(), whose `dropped` depends on the preceding steps.
 flag_marginals <- function(df, flags = names(FLAG_LABELS)) {
   tibble::tibble(
     flag = flags,
@@ -205,6 +191,9 @@ flag_marginals <- function(df, flags = names(FLAG_LABELS)) {
 }
 
 #' Step-by-step attrition for an ordered set of flags
+#'
+#' @return One row per step, starting with "all plays": `dropped` is
+#'   conditional on every earlier step.
 funnel <- function(df, flags, labels = FLAG_LABELS, groups = FLAG_GROUP) {
   stopifnot(
     all(flags %in% names(labels)),

@@ -2,17 +2,9 @@
 # Reduce 18.3M tracking rows to one row per play and one row per
 # (play, player).
 #
-# SCOPE: measured facts only. Nothing here drops a play, and nothing here
-# is a modeling choice. Every column answers a question of the form "what
-# is true of this play in the data", never "should this play be kept".
-# That distinction is the whole point of the file: the exclusion rule in
-# scripts/04_build_sample.R reads these columns, and the notebook reports
-# them, so neither has to rescan the tracking data or hold intermediate
-# objects alive to stay consistent.
-#
-# The one judgment call is the kinematic thresholds, which live in
-# R/constants.R. The row-level defect table is rebuilt from raw s / a /
-# dis on every run, so changing a threshold is a re-run of this script.
+# Records measured facts only and drops no plays; exclusion decisions are
+# made in scripts/04_build_sample.R from these columns. Kinematic defect
+# thresholds come from R/constants.R.
 #
 # Outputs, all in data/processed/:
 #   player_play_index.parquet  one row per (play, player)
@@ -39,12 +31,10 @@ trk <- open_dataset(path(processed, "tracking"))
 plays <- read_parquet(path(processed, "plays.parquet"))
 targets <- read_parquet(path(processed, "targeted_receiver.parquet"))
 
-#' Events worth pinning a frame number to
+#' Events whose first frame is recorded per play (as `f_<event>`)
 #'
-#' pass_shovel and pass_lateral are here because some recorded pass
-#' attempts carry no pass_forward event at all; the throw on those plays
-#' is labeled differently. Whether to accept them as a throw anchor is a
-#' decision, and it lives in R/sample_rules.R, not here.
+#' Includes alternative throw events (pass_shovel, pass_lateral) because
+#' some passes have no pass_forward event.
 ANCHOR_EVENTS <- c(
   "ball_snap",
   "pass_forward",
@@ -63,15 +53,13 @@ ANCHOR_EVENTS <- c(
   "tackle"
 )
 
-# Events whose multiplicity matters: min() silently takes the first of
-# several, and where a play has more than one forward pass, "first" may be
-# the wrong one.
+# Events whose per-play count is recorded (as `n_ev_<event>`), since
+# `f_<event>` keeps only the first occurrence.
 COUNTED_EVENTS <- c("ball_snap", "pass_forward", "pass_arrived")
 
 # ---- pass 1: player-level frame spans, position, side, route ----------
-# Grouping by side / position / route rather than aggregating them asserts
-# that they are constant within a player-play: if any varied, the key
-# below would be non-unique and the stopifnot() would fire.
+# Grouping by side, position, and route also checks they are constant
+# within a player-play: otherwise the key assertion below fails.
 
 message("[1/6] player frame spans")
 
@@ -87,10 +75,8 @@ player_play <- trk |>
   collect() |>
   cast_keys() |>
   mutate(
-    # n_rows rather than n_distinct(frame_id): on a deduplicated build the
-    # two are equal, so this test fails for a surplus row as readily as
-    # for a missing one. A negative frames_lost downstream means
-    # duplication was reintroduced upstream.
+    # Uses n_rows rather than n_distinct(frame_id) so surplus rows fail
+    # the test as well as missing ones.
     span = max_frame - min_frame + 1L,
     gapless = n_rows == span,
     starts_at_one = min_frame == 1L
@@ -131,10 +117,8 @@ ball_frames <- trk |>
   cast_keys()
 
 # ---- pass 4: key uniqueness tripwire ---------------------------------
-# 02_build_canonical.R deduplicates and asserts, so this should return
-# nothing. It stays as a tripwire: a nonzero count means the cleaning step
-# regressed. Ball rows carry nfl_id = NA, so this also covers "exactly one
-# ball row per frame".
+# Expected to be empty after 02. Ball rows have nfl_id = NA, so this
+# also checks for one ball row per frame.
 
 message("[4/6] duplicate key tripwire")
 
@@ -157,8 +141,7 @@ dup_rollup <- dup_keys |>
   mutate(has_duplicate_rows = TRUE)
 
 # ---- pass 5: event timeline ------------------------------------------
-# `event` is populated on every row of the frame in which the event
-# occurs, so deduplicate to the frame level before counting.
+# `event` repeats on every row of its frame; deduplicate to frame level.
 
 message("[5/6] event timeline")
 
@@ -257,8 +240,7 @@ defect_rollup <- defects |>
   )
 
 # ---- rollups from the player-level table -----------------------------
-# side counts, route counts, and gap counts all come off player_play
-# rather than from further scans of the tracking data.
+# Computed from player_play rather than rescanning tracking data.
 
 player_rollup <- player_play |>
   group_by(game_id, play_id) |>
@@ -269,8 +251,7 @@ player_rollup <- player_play |>
     n_distinct_last = n_distinct(max_frame),
     n_gapped = sum(!gapless),
     n_not_starting_at_one = sum(!starts_at_one),
-    # route is NA for every defender, so this is an offense-only count
-    # without needing a side filter.
+    # route is NA for defenders, so this counts offensive routes.
     n_routes = sum(!is.na(route)),
     .groups = "drop"
   )
@@ -325,10 +306,8 @@ play_index <- play_rows |>
       .default = "more ball frames than play frames"
     ),
 
-    # The row-count identity n_rows = n_players * n_frames can fail two
-    # ways, and a within-player gap check only sees one of them: a player
-    # who drops out at frame 40 while everyone else runs to frame 60 is
-    # gapless, starts at frame one, and still breaks the identity.
+    # A play is ragged when n_rows != n_players * n_frames, from internal
+    # gaps, players with different end frames, or both.
     ragged = n_rows != n_players * n_frames,
     frames_lost = n_players * n_frames - n_rows,
     ragged_cause = case_when(
@@ -343,9 +322,7 @@ play_index <- play_rows |>
   arrange(game_id, play_id)
 
 # ---- integrity checks ------------------------------------------------
-# These were five rows of a gt() table in the notebook. They belong here:
-# a join that silently matches nothing should stop the build, not produce
-# a zero in a document nobody rereads.
+# All counts are expected to be zero.
 
 players_tbl <- read_parquet(path(processed, "players.parquet"))
 
@@ -388,8 +365,8 @@ print(as.data.frame(integrity))
 
 if (any(integrity$n > 0)) {
   warning(
-    "Integrity checks are nonzero. These were all zero as of the week-4 ",
-    "build; investigate before trusting the sample.",
+    "Integrity checks are nonzero; all are expected to be zero. ",
+    "Investigate before trusting the sample.",
     call. = FALSE
   )
 }

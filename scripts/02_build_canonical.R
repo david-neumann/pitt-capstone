@@ -1,12 +1,10 @@
 # scripts/02_build_canonical.R -----------------------------------------
 # interim -> processed. Cleaning, naming, and coordinate standardization.
 #
-# SCOPE: this script makes no analytical decisions and drops no plays. It
-# renames, deduplicates exactly-identical rows, derives is_ball / side /
-# team_abbr, rotates left-moving plays into a single coordinate frame, and
-# casts every identifier to int32. Anything that constitutes a modeling
-# choice lives downstream: exclusions in scripts/04_build_sample.R,
-# coverage collapsing in R/coverage.R.
+# Renames columns to snake_case, removes exactly duplicated tracking
+# rows, derives is_ball / side / team_abbr, standardizes coordinates so
+# the offense moves toward +x, and casts identifiers to int32. Drops no
+# plays.
 #
 # Run after 01_raw_to_parquet.R, before 03_build_play_index.R.
 
@@ -59,8 +57,7 @@ play_dir <- trk_raw |>
   ) |>
   cast_keys()
 
-# A play must have exactly one play direction, or standardization is
-# ill-defined for it.
+# Exactly one play direction per play.
 stopifnot(!any(duplicated(play_dir[c("game_id", "play_id")])))
 
 # --- plays ------------------------------------------------------------
@@ -77,9 +74,7 @@ require_cols(
 
 plays <- plays |>
   left_join(play_dir, by = c("game_id", "play_id")) |>
-  # Only the columns the rest of the project reads. Joining all of
-  # game_teams left plays.parquet carrying game_date, game_time_eastern,
-  # and a redundant copy of every abbreviation column.
+  # Only the game columns used downstream.
   left_join(
     select(game_teams, game_id, week, home_team, away_team),
     by = "game_id"
@@ -91,8 +86,8 @@ plays <- plays |>
 
 stopifnot(!anyNA(plays$play_direction))
 
-# side_lookup is joined onto 18.3M tracking rows below, so a duplicated
-# play key here would double those rows silently.
+# side_lookup is joined onto every tracking row below; a duplicated play
+# key would duplicate rows.
 stopifnot(!any(duplicated(plays[c("game_id", "play_id")])))
 
 write_parquet(plays, path(processed, "plays.parquet"))
@@ -123,11 +118,7 @@ stopifnot(!any(duplicated(targeted[c("game_id", "play_id")])))
 write_parquet(targeted, path(processed, "targeted_receiver.parquet"))
 
 # --- coverages (week 1 only) ------------------------------------------
-# The eight labels are written through verbatim. Collapsing them to the
-# man/zone binary is a modeling decision and happens in
-# scripts/04_build_sample.R via classify_coverage(). What this script does
-# is assert that every label still maps, so a vocabulary change is a
-# build-time error rather than a silent NA downstream.
+# Written verbatim; the man/zone collapse happens at the sample layer.
 
 coverages <- read_parquet(path(interim, "coverages_week1.parquet")) |>
   rename_with(to_snake) |>
@@ -145,9 +136,8 @@ write_parquet(coverages, path(processed, "coverages_week1.parquet"))
 side_lookup <- plays |>
   select(game_id, play_id, possession_team, home_team, away_team)
 
-# The raw week files contain exactly-duplicated rows on a small number of
-# plays. Deduplication happens here rather than in 01_raw_to_parquet.R so
-# the interim layer stays a faithful copy of the source CSVs.
+# The raw week files contain exactly duplicated rows on a few plays.
+# Removed here, not in 01, so the interim layer matches the source.
 dedup_log <- tibble(
   week = integer(),
   rows_in = integer(),
@@ -182,9 +172,8 @@ for (w in 1:17) {
         team == "away" ~ away_team,
         .default = NA_character_
       ),
-      # The NA branch is explicit so an unresolvable row surfaces as NA
-      # and trips the assertion below, rather than falling through to
-      # "defense".
+      # Unresolvable rows become NA (and fail the assertion below)
+      # rather than defaulting to "defense".
       side = case_when(
         is_ball ~ "ball",
         is.na(team_abbr) | is.na(possession_team) ~ NA_character_,
@@ -219,18 +208,14 @@ for (w in 1:17) {
       play_direction
     )
 
-  # Full-row distinct() collapses identical duplicates. A *conflicting*
-  # duplicate survives it, so assert on the key as well: a pair differing
-  # in any column (time, route) would otherwise double-weight a player in
-  # every per-frame aggregate downstream.
+  # distinct() leaves duplicates that differ in some column, so also
+  # assert key uniqueness.
   stopifnot(
     anyDuplicated(trk_week[c("game_id", "play_id", "nfl_id", "frame_id")]) == 0,
     !any(is.na(trk_week$side) & !trk_week$is_ball)
   )
 
-  # Both distinct() and the key assertion above are per-week, so a play
-  # appearing in two week files would pass both. Collect the keys and
-  # check across weeks once the loop finishes.
+  # Checked across weeks after the loop.
   week_keys[[w]] <- distinct(trk_week, game_id, play_id)
 
   write_parquet(

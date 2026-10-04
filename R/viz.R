@@ -1,14 +1,10 @@
 # R/viz.R --------------------------------------------------------------
-# Plotting helpers for BDB tracking data.
+# Field plots and play animations for tracking data.
 #
-# PRECONDITION: every function here assumes coordinates have already
-# passed through standardize_direction() in R/standardize.R, i.e. the
-# offense always advances toward +x. Passing raw left-direction plays
-# will render mirrored, and it will look plausible.
-#
-# Depends on R/constants.R for field geometry.
-# team_fill_palette() calls nflreadr::load_teams(), which needs network
-# access on first use and then caches for the session.
+# Unlike other R/ files, this attaches ggplot2, dplyr, and gganimate.
+# Assumes standardized coordinates (standardize_direction()). Team
+# colours come from nflreadr::load_teams(), which downloads on first use
+# and is cached for the session.
 
 library(ggplot2)
 library(dplyr)
@@ -24,33 +20,28 @@ source(here::here("R", "geometry.R"))
 #' Team metadata (abbreviations, colours), cached per session
 team_lookup <- function() {
   if (is.null(.viz_cache$teams)) {
-    # current = FALSE includes historical franchises, which matters for
-    # a 2018 season dataset.
+    # Include historical franchises (e.g. OAK) for 2018 data.
     .viz_cache$teams <- nflreadr::load_teams(current = FALSE)
   }
   .viz_cache$teams
 }
 
-#' Perceptual distance between two colours, in CIE Lab
-#'
-#' Lab rather than RGB because RGB distance doesn't track what the eye
-#' actually discriminates: two colours can be far apart in RGB and still
-#' read as identical on a projector.
+#' Perceptual distance between two colours (Euclidean, CIE Lab)
 lab_dist <- function(c1, c2) {
   m <- t(grDevices::col2rgb(c(c1, c2)))
   lab <- farver::convert_colour(m, from = "rgb", to = "lab")
   sqrt(sum((lab[1, ] - lab[2, ])^2))
 }
 
-#' Named fill palette for a single matchup
+#' Named fill palette for two teams
 #'
-#' Team colour palettes assume one team per chart. Putting two teams on
-#' one field breaks that assumption — plenty of matchups have near
-#' identical primaries (ATL/TB, SF/KC, ARI/WAS). When the primaries are
-#' too close, fall back to team_b's secondary.
+#' Uses each team's primary colour, switching `team_b` to its secondary
+#' when the primaries are too similar.
 #'
-#' @param min_dist Lab distance below which the primaries are treated as
-#'   indistinguishable. 30 is roughly "clearly different at a glance".
+#' @param team_a,team_b Team abbreviations.
+#' @param min_dist Lab distance below which primaries count as too
+#'   similar.
+#' @return Named character vector of two colours.
 team_fill_palette <- function(team_a, team_b, min_dist = 30) {
   teams <- team_lookup()
 
@@ -79,15 +70,12 @@ team_fill_palette <- function(team_a, team_b, min_dist = 30) {
 }
 
 #' White or near-black label text, whichever contrasts with the fill
-#'
-#' Hardcoded white vanishes on light primaries (LAC powder blue, GB gold
-#' as a secondary), so pick per-marker.
 label_colour <- function(fill) {
   lum <- as.vector(t(grDevices::col2rgb(fill)) %*% c(0.2126, 0.7152, 0.0722))
   ifelse(lum > 140, "grey10", "white")
 }
 
-#' Resolve a palette from the data when the caller didn't supply one
+#' Return `pal`, or build one from the two teams in `df`
 resolve_palette <- function(df, pal = NULL, min_dist = 30) {
   if (!is.null(pal)) {
     return(pal)
@@ -106,14 +94,15 @@ resolve_palette <- function(df, pal = NULL, min_dist = 30) {
 
 # ---- field ------------------------------------------------------------
 
-#' Empty standardized field
+#' Empty field in standardized coordinates
 #'
-#' @param los_x Line of scrimmage in standardized coordinates (los_x
-#'   from plays.parquet, not absolute_yardline_number).
-#' @param yards_to_go Distance to the first-down marker.
-#' @param xlim Visible window in x. Yard markings outside it are skipped
-#'   rather than drawn and clipped, which keeps the grob count down —
-#'   this matters when animating, since the field is redrawn per frame.
+#' @param los_x Line of scrimmage, standardized (`los_x` in
+#'   plays.parquet). Drawn when supplied.
+#' @param yards_to_go Distance to the first-down line. Drawn when
+#'   supplied with `los_x`.
+#' @param xlim Visible x range. Markings outside it are not drawn.
+#' @param hash_marks,sideline_ticks Draw the 1-yard marks.
+#' @param turf,endzone Fill colours.
 gg_field <- function(
   los_x = NULL,
   yards_to_go = NULL,
@@ -238,11 +227,11 @@ gg_field <- function(
 
 # ---- marker styling ---------------------------------------------------
 
-#' Precompute per-row marker and label colours
+#' Add per-row label and outline colours
 #'
-#' Both the marker outline and the jersey text use scale_colour_identity(),
-#' so the values are computed here rather than mapped through a scale.
-#' Outline encodes offense/defense, which team colours alone would lose.
+#' Adds `.txt_col` (jersey text) and `.out_col` (marker outline: white
+#' for offense, dark for defense when `outline_side` is TRUE), for use
+#' with scale_colour_identity().
 style_players <- function(players, pal, outline_side = TRUE) {
   players |>
     mutate(
@@ -257,10 +246,14 @@ style_players <- function(players, pal, outline_side = TRUE) {
 
 # ---- static frame -----------------------------------------------------
 
-#' One frame: players as jersey-numbered discs, ball as a small point
+#' Plot one frame: players as jersey-numbered markers, plus the ball
 #'
-#' @param pal Optional named palette from team_fill_palette(). Supply it
-#'   explicitly when rendering multiple frames so colours stay fixed.
+#' @param frame_df Tracking rows for a single play and frame.
+#' @param los_x,yards_to_go Passed to gg_field().
+#' @param pal Named palette from team_fill_palette(). Pass the same one
+#'   to keep colours fixed across frames.
+#' @param outline_side Outline markers by offense/defense.
+#' @param hash_marks Passed to gg_field().
 plot_frame <- function(
   frame_df,
   los_x = NULL,
@@ -305,13 +298,16 @@ plot_frame <- function(
 
 # ---- animation --------------------------------------------------------
 
-#' Build a gganimate object for one play
+#' Animate one play
 #'
-#' @param show_velocity Draw velocity vectors scaled to 0.5s of travel.
-#'   These are a useful sanity check: arrows come from s/dir while the
-#'   visible motion comes from x/y, so a bad angle convention shows up
-#'   as arrows that trail, lead, or sit perpendicular to the movement.
-#' @param pad Yards of margin around the action in x.
+#' @param play_trk Tracking rows for the play.
+#' @param this_play One-row play record with `los_x` and `yards_to_go`.
+#' @param show_velocity Draw velocity arrows (0.5 s of travel). Arrows
+#'   come from `s`/`dir` and motion from `x`/`y`, so disagreement between
+#'   them reveals an angle-convention error.
+#' @param pad Margin in yards around the players' x range.
+#' @param pal,outline_side,hash_marks As in plot_frame().
+#' @return A gganimate object, timed in seconds from the snap.
 animate_play <- function(
   play_trk,
   this_play,
@@ -398,17 +394,14 @@ animate_play <- function(
 
 #' Render a play to disk at real-time speed
 #'
-#' Sets nframes to the actual frame count and fps to the capture rate, so
-#' there's one animation frame per tracking frame and no interpolation.
-#' gganimate's default of 100 frames tweens the motion, which looks
-#' subtly wrong.
+#' One animation frame per tracking frame at TRACKING_HZ, with no
+#' interpolation.
 #'
-#' Defaults to GIF via gifski. GIFs are larger than mp4 for the same
-#' clip, but they embed in Quarto/reveal.js output with a plain <img> tag
-#' and loop on their own — no video element, no autoplay policy to fight.
-#'
-#' @param path Output file. An extensionless path gets .gif appended;
-#'   pass .mp4 explicitly to render video via av instead.
+#' @param play_trk,this_play As in animate_play().
+#' @param path Output file, .gif (gifski) or .mp4 (av). A path without an
+#'   extension gets .gif.
+#' @param width,height Size in pixels.
+#' @param ... Passed to animate_play().
 render_play <- function(
   play_trk,
   this_play,

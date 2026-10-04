@@ -1,13 +1,9 @@
 # scripts/04_build_sample.R --------------------------------------------
 # Apply the sample definition.
 #
-# SCOPE: this is the only script in the project that decides which plays
-# are in and which are out. It scans no tracking data — every input is a
-# measured column from play_index.parquet — so it runs in seconds and can
-# be re-run freely while the rule is still being argued about.
-#
-# The rule itself is in R/sample_rules.R. Changing SAMPLE_RULE there and
-# re-running this script changes the sample everywhere downstream.
+# Builds the exclusion flags, reports attrition under both candidate
+# rules, and writes the plays that pass SAMPLE_RULE (R/sample_rules.R).
+# Reads play-level tables only; no tracking scan.
 #
 # Outputs, all in data/processed/:
 #   sample_flags.parquet     one row per play, every keep_* flag
@@ -35,10 +31,8 @@ plays <- read_parquet(path(processed, "plays.parquet"))
 play_index <- read_parquet(path(processed, "play_index.parquet"))
 coverages <- read_parquet(path(processed, "coverages_week1.parquet"))
 
-# The spine is the play table, not the tracking data. 03 verified the two
-# agree in both directions; assert it again here because a play present in
-# one and not the other would show up as an all-NA row of flags rather
-# than as an error.
+# plays and play_index must cover the same plays; a mismatch would
+# produce rows of NA flags rather than an error.
 stopifnot(
   nrow(plays) == nrow(play_index),
   nrow(anti_join(
@@ -56,16 +50,14 @@ sample_flags <- add_sample_flags(plays, play_index, coverages)
 stopifnot(
   nrow(sample_flags) == nrow(plays),
   !any(duplicated(sample_flags[c("game_id", "play_id")])),
-  # A flag that is NA anywhere means a coalesce() is missing in
-  # add_sample_flags(), and apply_flags() would quietly treat it as FALSE.
+  # apply_flags() would treat an NA flag as FALSE.
   !any(map_lgl(sample_flags[names(FLAG_LABELS)], anyNA))
 )
 
 write_parquet(sample_flags, path(processed, "sample_flags.parquet"))
 
 # ---- funnel ----------------------------------------------------------
-# Both rules, stacked long. The notebook pivots on step_index to show them
-# side by side; the two differ only at steps 3 and 8.
+# Both rules, stacked long; they differ only at steps 3 and 8.
 
 sample_funnel <- bind_rows(
   funnel(sample_flags, SCOPED_FLAGS) |> mutate(rule = "scoped"),
@@ -81,12 +73,9 @@ write_parquet(sample_funnel, path(processed, "sample_funnel.parquet"))
 print(as.data.frame(filter(sample_funnel, rule == "scoped")))
 
 # ---- the analytical sample -------------------------------------------
-# has_kinematic_defect and defect_in_window travel with the sample rather
-# than being filtered away, so a downstream model can test sensitivity to
-# the scoped-versus-conservative choice without rebuilding the funnel.
-# Every surviving play has defect_in_window == FALSE;
-# has_kinematic_defect == TRUE marks the plays the conservative rule would
-# have dropped.
+# has_kinematic_defect is kept so sensitivity to the scoped rule can be
+# checked downstream: TRUE marks retained plays with a defect outside the
+# snap-to-throw window. defect_in_window is FALSE for every retained play.
 
 keep <- apply_flags(sample_flags, SAMPLE_RULE)
 
@@ -124,9 +113,8 @@ analytic_sample <- sample_flags |>
     defect_in_window
   ) |>
   mutate(
-    # The throw anchor the sample rule actually accepted, so downstream
-    # code never has to re-derive the pass_forward / pass_shovel
-    # precedence. Consistent with keep_any_throw in R/sample_rules.R.
+    # Throw frame accepted by keep_any_throw: pass_forward, else
+    # pass_shovel.
     f_throw = coalesce(f_pass_forward, f_pass_shovel),
     throw_anchor = if_else(
       !is.na(f_pass_forward),
@@ -134,6 +122,9 @@ analytic_sample <- sample_flags |>
       "pass_shovel"
     ),
     t_throw = (f_throw - f_ball_snap) / TRACKING_HZ,
+    # t_arrive and t_flight use the pass_arrived event, which is missing
+    # disproportionately on incompletions (notes/decisions.md §6.1).
+    # Superseded by R/arrival.R; do not model on them.
     t_arrive = (f_pass_arrived - f_ball_snap) / TRACKING_HZ,
     t_flight = (f_pass_arrived - f_throw) / TRACKING_HZ,
     frames_pre_snap = f_ball_snap - first_frame,

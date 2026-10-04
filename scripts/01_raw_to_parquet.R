@@ -1,3 +1,11 @@
+# scripts/01_raw_to_parquet.R ------------------------------------------
+# raw -> interim. Converts the Kaggle CSVs to Parquet without modifying
+# their contents, so later steps never re-read CSV.
+#
+# Outputs, in data/interim/:
+#   games, players, plays, targetedReceiver, coverages_week1 (.parquet)
+#   tracking/week_NN.parquet  one file per week, with a `week` column
+
 library(readr)
 library(dplyr)
 library(arrow)

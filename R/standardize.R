@@ -1,19 +1,19 @@
 # R/standardize.R ------------------------------------------------------
-# Coordinate-frame normalization. Defines functions only.
+# Coordinate-frame normalization.
 
 source(here::here("R", "constants.R"))
 
-#' Rotate left-moving plays 180 degrees so every offense advances in +x
+#' Rotate left-moving plays so every offense advances toward +x
 #'
-#' Reflecting BOTH x and y is a rotation, not a mirror. Flipping only x
-#' would mirror the field and silently swap offensive left and right,
-#' which is a bug that produces entirely plausible-looking output.
-#' Angles shift by 180 degrees under the same rotation, which holds
-#' regardless of where the angle convention places zero.
+#' Reflects both `x` and `y`, which is a 180-degree rotation. Reflecting
+#' `x` alone would mirror the field and swap the offense's left and
+#' right. `dir` and `o` shift by 180 degrees.
 #'
-#' The play_direction guard matters because if_else() propagates an NA
-#' condition into an NA result: a single unresolved play_direction would
-#' blank x, y, dir, and o for every row of that play rather than erroring.
+#' Errors on a missing `play_direction`, since `if_else()` would otherwise
+#' set every coordinate on that play to NA.
+#'
+#' @param df Tracking rows with `play_direction`, `x`, `y`, `dir`, `o`.
+#' @return `df` with standardized `x`, `y`, `dir`, `o`.
 standardize_direction <- function(df) {
   if (anyNA(df$play_direction)) {
     stop(
@@ -34,7 +34,7 @@ standardize_direction <- function(df) {
     )
 }
 
-#' Flip a line-of-scrimmage value into standardized coordinates
+#' Convert a line-of-scrimmage x value to standardized coordinates
 standardize_los <- function(los, play_direction) {
   dplyr::if_else(play_direction == "left", FIELD_LENGTH - los, los)
 }

@@ -1,28 +1,16 @@
 # scripts/05_join_pbp.R ------------------------------------------------
-# nflverse play-by-play -> processed. The only build script that touches
-# the network. (R/viz.R also calls nflreadr, for team colours, on first
-# use of team_fill_palette().)
+# nflverse play-by-play -> processed. Downloads on the first run only.
 #
-# SCOPE: measured facts only, same rule as 03_build_play_index.R.
-# Nothing here drops a play and nothing here is a modeling choice.
-# `qb_spike` is a fact; `keep_not_spike` is a decision and belongs in
-# R/sample_rules.R applied by scripts/08_build_model_frame.R, with a
-# label in FLAG_LABELS so it appears in the question-level funnel.
+# Records measured facts only and drops no plays; flags such as
+# `qb_spike` are applied as filters later, via R/sample_rules.R.
 #
-# SPINE: the keys of data/processed/plays.parquet, all 19,239 plays,
-# left join. NOT the analytic sample — a play that exits the sample
-# later should still carry its pbp row, or re-scoping the question means
-# rebuilding this file. Keys only, not the whole play table: 08 joins
-# the two, and carrying a second copy of every play-level column here is
-# how `cp.x` and `cp.y` happen.
+# The output is left-joined onto the keys of every play in
+# data/processed/plays.parquet (not just the analytic sample) and carries
+# no other play-level columns.
 #
-# THE MIRROR STEP. nflreadr data is revised between releases, so the raw
-# pull is written to data/interim/ before anything is done to it, for
-# the same reason 01_raw_to_parquet.R exists: results produced in
-# October have to reproduce in December. `nflverse_timestamp` is an
-# attribute on the returned object and attributes do not survive a
-# parquet round trip, so the sidecar metadata file is the only chance to
-# keep it.
+# nflverse data is revised between releases, so the raw pull is mirrored
+# to data/interim/ before use, with its release timestamp saved in a
+# sidecar file (object attributes do not survive Parquet).
 #
 # Outputs, in data/interim/:
 #   pbp_2018.parquet             verbatim nflreadr pull
@@ -31,22 +19,18 @@
 #   pbp.parquet                  one row per play, on the plays keys
 #   pbp_outcome_agreement.parquet  the join check, persisted
 #
-# Derived columns written by this script and by nothing else:
-#   pbp_matched   the join found a pbp row for this play
-#   has_cp        cp is present — see the note below, this is not MCAR
-#   has_air_yards air_yards is present
+# Derived columns:
+#   pbp_matched    the join found a pbp row for this play
+#   has_cp         cp is present
+#   has_air_yards  air_yards is present
 #
-# `cp` IS MISSING ON A NONRANDOM SUBSET, in two ways. It is missing
-# wherever air_yards is, and it is missing on penalty-nullified plays
-# (§4), which run heavily incomplete. Delta log loss across model stages
-# is only comparable when every stage is scored on the same rows, so the
-# headline comparison against the benchmark runs on has_cp == TRUE with
-# full-sample numbers for the other stages reported alongside. has_cp
-# travels with the data rather than being filtered on, the same pattern
-# as defect_in_window in the sample layer.
+# `cp` is present only where `air_yards` is, and is also missing on some
+# plays that have `air_yards`. Penalty-nullified plays (play_type
+# "no_play"), which are mostly incomplete, have neither. has_cp is
+# therefore not missing at random; it is carried as a flag, not filtered
+# on.
 #
-# Run after 02_build_canonical.R. Independent of 03, 04, and 06.
-# Requires network access on the first run only.
+# Run after 02_build_canonical.R. Independent of 03 and 04.
 
 library(arrow)
 library(dplyr)
@@ -67,9 +51,8 @@ plays <- read_parquet(path(processed, "plays.parquet"))
 
 
 # --- 1. mirror the pull -----------------------------------------------
-# The condition covers both files: a mirror without its provenance
-# sidecar is re-pulled rather than silently accepted, because
-# nflverse_timestamp cannot be recovered after the fact.
+# Re-pull if either file is missing, since the timestamp cannot be
+# recovered later.
 
 if (!file_exists(mirror) || !file_exists(mirror_meta)) {
   message("Pulling nflverse play-by-play for 2018")
@@ -100,9 +83,6 @@ print(as.data.frame(pbp_meta))
 
 
 # --- 2. keys ----------------------------------------------------------
-# standardize_pbp_keys() drops nflverse's own game_id, renames
-# old_game_id, casts both keys to int32, and errors on an unparseable or
-# duplicated key.
 
 pbp <- standardize_pbp_keys(pbp_2018)
 
@@ -120,24 +100,18 @@ print(tibble(
   )
 ))
 
-# Direction one is asserted rather than printed. A nonzero value means
-# the key cast produced identifiers that do not exist in nflverse, which
-# is a total join failure wearing the costume of a low match rate.
+# Every BDB game must exist in nflverse; otherwise the key cast is wrong.
 stopifnot(length(setdiff(bdb_games, nfl_games)) == 0)
 
-# Direction two is expected to be nonzero, and its composition is the
-# content: 11 postseason games plus the 3 week-1 games BDB omits (BDB
-# ships 253 of the season's 256). A surplus game in any other week is a
-# gap on the BDB side to record, not a postseason artifact.
+# Expected: 11 postseason games plus 3 week-1 games absent from BDB
+# (253 of 256 regular-season games).
 pbp |>
   filter(game_id %in% setdiff(nfl_games, bdb_games)) |>
   distinct(game_id, week) |>
   count(week) |>
   print(n = Inf)
 
-# BDB games per week, for the same reason: week 1 is 13 games, not 16,
-# which is the denominator behind the week-1 coverage labels and the
-# arrival-anchor prototyping sample.
+# BDB games per week (week 1 has 13).
 plays |>
   group_by(week) |>
   summarize(games = n_distinct(game_id), plays = n(), .groups = "drop") |>
@@ -153,11 +127,8 @@ pbp_sel <- pbp |>
   rename(week_pbp = week) |>
   mutate(pbp_matched = TRUE)
 
-# pbp_matched is a sentinel set before the join, not inferred from a
-# content column afterwards: cp and air_yards are legitimately missing
-# on matched rows, so is.na() on either would conflate "no pbp row" with
-# "pbp row without a charted throw". Same pattern as target_tracked in
-# 03_build_play_index.R.
+# pbp_matched is set before the join because cp and air_yards can be
+# missing on matched rows.
 pbp_out <- plays |>
   select(game_id, play_id) |>
   left_join(pbp_sel, by = c("game_id", "play_id")) |>
@@ -169,15 +140,9 @@ pbp_out <- plays |>
 
 
 # --- 4. validate the join ---------------------------------------------
-# A high key match rate is consistent with having matched real keys to
-# the WRONG plays, which would put one play's air yards beside another
-# play's coverage geometry and still train, converge, and report
-# plausible log loss. So this section verifies identity, not coverage,
-# using two facts both sources record independently: the outcome and the
-# description.
-#
-# `check` is scratch. It is never written; the artifact stays narrow and
-# the checks join what they need.
+# A match rate cannot show that keys matched the right plays, so the
+# outcome and the description are compared between sources. `check` is
+# not written.
 
 check <- pbp_out |>
   left_join(
@@ -203,17 +168,14 @@ check |>
   count(pass_result, quarter, sort = TRUE) |>
   print(n = 20)
 
-# 4.2 week redundancy. Zero. A nonzero value means a BDB game_id matched
-# a game in a different week, which is a bad cast that still found
-# partners — the failure the game-set check cannot see.
+# 4.2 week agreement between sources.
 stopifnot(sum(check$week != check$week_pbp, na.rm = TRUE) == 0)
 
-# 4.3 the decisive check
+# 4.3 outcome agreement
 oa <- outcome_agreement(check)
 print(as.data.frame(oa))
 
-# Three kinds of non-agreement, separated. Only the first indicts the
-# join; see the header of outcome_agreement() in R/pbp.R.
+# Only oa_bad indicates a join error; see outcome_agreement().
 oa_bad <- filter(oa, checkable, nfl_outcome != "no pass recorded", !agrees)
 oa_nullified <- filter(
   oa,
@@ -225,19 +187,15 @@ oa_nullified <- filter(
 message("off-diagonal plays (real outcome disagreement): ", sum(oa_bad$n))
 message("matched plays with no nflverse pass outcome: ", sum(oa_nullified$n))
 
-# 4.4 what the no-pass-recorded block is. plays.parquet already carries
-# the BDB penalty columns, so this needs nothing from nflverse.
+# 4.4 composition of the no-pass-recorded block, by BDB penalty columns.
 check |>
   filter(pbp_matched, play_type == "no_play") |>
   count(has_penalty = !is.na(penalty_codes), is_defensive_pi, pass_result) |>
   arrange(desc(n)) |>
   print(n = 20)
 
-# The outcome skew is the finding, not the count. Defensive pass
-# interference nullifies incompletions, so this block runs far more
-# incomplete than the sample it is being removed from — the same shape
-# of problem as the missing-LOS block in 01_eda.qmd 2.6, and it has to
-# be recorded the same way, with counts, in notes/decisions.md.
+# Outcome composition of nullified vs other throws (notes/decisions.md
+# §8.3).
 check |>
   filter(pbp_matched, pass_result %in% c("C", "I", "IN")) |>
   mutate(nullified = play_type == "no_play") |>
@@ -247,21 +205,17 @@ check |>
   ungroup() |>
   print(n = 20)
 
-# And whether cp survives on them, which is what decides the benchmark's
-# scoring population.
+# cp availability on nullified plays.
 check |>
   count(nullified = play_type == "no_play", has_cp) |>
   print(n = 20)
 
-# 4.5 the independent second opinion. Read p10_similarity, not
-# agree_exact.
+# 4.5 description agreement; p10_similarity is the headline.
 da <- desc_agreement(check)
 print(as.data.frame(da$summary))
 print(as.data.frame(da$examples))
 
-# 4.6 air_yards plausibility, and the boundary that matters for 08.
-# air_yards == 0 is the ambiguous case for a beyond-the-LOS filter, so
-# count it explicitly rather than reading it off a quantile.
+# 4.6 air_yards distribution, with exact counts at and below zero.
 check |>
   filter(has_air_yards) |>
   summarize(
@@ -288,10 +242,7 @@ stopifnot(
   !anyNA(pbp_out$has_air_yards)
 )
 
-# Pinned after inspection, not before: as of the pull recorded in
-# pbp_2018_meta.parquet, every matched play with a real nflverse pass
-# outcome agrees with BDB's pass_result. The nullified block is counted
-# separately in 4.3 and is not a disagreement about what happened.
+# Zero as of the mirrored pull. Nullified plays are counted separately.
 stopifnot(sum(oa_bad$n) == 0)
 
 assert_no_leak_cols(pbp_out)
