@@ -401,6 +401,8 @@ animate_play <- function(
 #' @param path Output file, .gif (gifski) or .mp4 (av). A path without an
 #'   extension gets .gif.
 #' @param width,height Size in pixels.
+#' @param res Resolution passed to the graphics device. Point sizes and text
+#'   scale with it, so it is fixed rather than taken from the caller.
 #' @param ... Passed to animate_play().
 render_play <- function(
   play_trk,
@@ -408,6 +410,7 @@ render_play <- function(
   path,
   width = 900,
   height = 500,
+  res = 72,
   ...
 ) {
   anim <- animate_play(play_trk, this_play, ...) +
@@ -437,9 +440,11 @@ render_play <- function(
     fps = TRACKING_HZ,
     width = width,
     height = height,
-    # Explicit, because under knitr gganimate takes units = "in" from the
-    # chunk options and would read width and height as inches.
+    # Explicit, because under knitr gganimate takes the device size,
+    # units, and resolution from the chunk options (units = "in", and dpi
+    # doubled for retina), which would change the plot's proportions.
     units = "px",
+    res = res,
     renderer = renderer
   )
 }

@@ -126,7 +126,15 @@ tibble(
   gt_theme_538(quiet = TRUE)
 
 no_arrival |>
-  select(game_id, play_id, week, pass_result, throw_anchor, f_throw, last_frame) |>
+  select(
+    game_id,
+    play_id,
+    week,
+    pass_result,
+    throw_anchor,
+    f_throw,
+    last_frame
+  ) |>
   gt() |>
   tab_header(title = "Plays with a tracked target but no approach series") |>
   gt_theme_538(quiet = TRUE)
@@ -567,7 +575,7 @@ gif_paths <- map_chr(seq_len(nrow(picks)), \(i) {
     "week06",
     sprintf("arrival_%s_%s_%s.gif", a1$pass_result, a1$game_id, a1$play_id)
   )
-  render_play(play_trk, this_play, path, width = 800, height = 450, pal = pal)
+  render_play(play_trk, this_play, path, pal = pal)
   path
 })
 
@@ -748,8 +756,14 @@ map(thresholds, \(th) {
   )) |>
   gt() |>
   tab_header(title = "Candidate beyond-the-line rules") |>
-  fmt_number(columns = c(kept, starts_with("kept,"), starts_with("dropped,")), decimals = 0) |>
-  fmt_percent(columns = c(pct_kept, complete_kept, complete_dropped), decimals = 1) |>
+  fmt_number(
+    columns = c(kept, starts_with("kept,"), starts_with("dropped,")),
+    decimals = 0
+  ) |>
+  fmt_percent(
+    columns = c(pct_kept, complete_kept, complete_dropped),
+    decimals = 1
+  ) |>
   sub_missing(missing_text = "") |>
   gt_theme_538(quiet = TRUE)
 

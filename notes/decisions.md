@@ -1286,9 +1286,11 @@ the reference point for stages 3 and 4.
 - `paired_delta()` sets its seed through `withr::with_seed()`, leaving the
   global RNG untouched.
 - **gganimate under knitr reads the chunk's figure options as device
-  defaults**, including `units = "in"`, so a `width = 800` meant as pixels
-  becomes 800 inches and the render appears to hang. `render_play()` passes
-  `units = "px"` explicitly. GIFs need `gifski` (recorded in `renv.lock`, as is
+  defaults**: `units = "in"`, so a `width` meant as pixels becomes inches and
+  the render appears to hang; and `res` equal to the chunk dpi, doubled for
+  retina (192), which draws markers and text about 2.7 times larger than a
+  render outside knitr (72). `render_play()` passes `units = "px"` and
+  `res = 72` explicitly, so output is the same in and out of a notebook. GIFs need `gifski` (recorded in `renv.lock`, as is
   `av` for mp4).
 - **Each `gt_theme_538()` table embeds its own copy of the Google fonts** under
   `embed-resources: true`, so notebooks with many tables render to HTML files of
