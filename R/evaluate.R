@@ -476,7 +476,10 @@ paired_delta <- function(
   )
 
   keys <- c("game_id", "play_id")
-  ref <- preds[preds$model == reference, unique(c(keys, cluster, "complete", ".pred"))]
+  ref <- preds[
+    preds$model == reference,
+    unique(c(keys, cluster, "complete", ".pred"))
+  ]
   mod <- preds[preds$model == model, c(keys, "complete", ".pred")]
 
   paired <- dplyr::inner_join(ref, mod, by = keys, suffix = c("_ref", "_mod"))
