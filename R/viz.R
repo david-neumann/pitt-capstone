@@ -437,6 +437,9 @@ render_play <- function(
     fps = TRACKING_HZ,
     width = width,
     height = height,
+    # Explicit, because under knitr gganimate takes units = "in" from the
+    # chunk options and would read width and height as inches.
+    units = "px",
     renderer = renderer
   )
 }
