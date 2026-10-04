@@ -491,7 +491,8 @@ Position is not. On plays carrying both labels, ball displacement between them:
 | IN | 5 | 2.30 | 5.95 | +1.06 |
 
 The error is systematically downfield and its magnitude depends on the outcome.
-The passing-window corridor is 2–3 yd wide, so a p90 error of 8 yd is
+The coverage features work at a scale of a couple of yards (separation, a
+defender's reach), so a p90 error of 8 yd is
 disqualifying. `pass_outcome_incomplete` fires when the ball hits the turf, well
 past the receiver.
 
@@ -719,8 +720,8 @@ Charted zero is a convention for throws at the line.
 tracking-derived coverage geometry, on passes thrown beyond the line of
 scrimmage to a tracked targeted receiver (§4.9). Separation is a feature of
 that model rather than a separate question. Candidate geometry: receiver
-separation and closing speed (stage 3); leverage, the passing-window corridor,
-and time-to-arrival (stage 4).
+separation and closing speed (stage 3); leverage, time-to-arrival, and the
+passing window (stage 4).
 
 Scoped out, with reasons: **coverage classification** (labels exist for week 1
 only, §3, and there is recent published work), and **space-control / pitch-
@@ -750,6 +751,31 @@ cross-validation. Details in §9.
 - **Spikes and scrambles** are already out of the base sample (§4.9).
 - **Four untargeted interceptions** reviewed on video and excluded with the
   other untargeted throws (§4.9).
+- **Passing window: time-based, with no fixed-width corridor.** A fixed width
+  (the earlier "2 yd or 3 yd" item) is a crude stand-in for whether a defender
+  can get into the ball's path, which depends on the defender's distance and
+  velocity and on the ball's flight time, and it would add a free parameter. The
+  passing window is built on the time-to-arrival machinery (`time_to_point()`)
+  and covers **defenders other than the nearest defender to the targeted
+  receiver**, who is measured by separation in stage 3.
+  - **Nearest defender** is determined at the throw frame, as separation is.
+  - **Each defender is timed to their best intercept point along the lane.**
+    At lane fraction $u \in [0, 1]$ (release to arrival) the ball arrives at
+    about $uT$, with $T$ the flight time (reasonable given the near-constant
+    implied speed in §6.9), and defender $j$ needs $\tau_j(u)$ from
+    `time_to_point()`. The defender's margin is
+    $m_j = \max_u \, [\, uT - \tau_j(u) \,]$, in seconds; positive means
+    the defender can get into the ball's path before it passes. Timing only to
+    the arrival point would mostly measure help coverage at the catch.
+  - **Model feature: the largest margin** across those defenders — how well
+    placed the best help defender is. One continuous value with no threshold,
+    entered as a smooth. The count of defenders with a positive margin is
+    reported descriptively only: as a feature it would reintroduce a hard
+    cutoff (at 0 s) and is mostly 0 or 1. Plays with no other tracked defender,
+    and ties for the nearest defender at the throw frame, are handled
+    explicitly in `07`.
+  - No ball height: a defender who can reach the middle of a high deep throw
+    counts as in the window although the ball passes over. Stated, not patched.
 - **Beyond-the-LOS threshold: $\text{depth}_{\text{arr}} > 0$**, the ball
   arrives beyond the line of scrimmage (§6.9). A population filter, applied in
   `08`. On the 16,641 throws with both measures:
@@ -781,7 +807,6 @@ cross-validation. Details in §9.
   (§4.7), not by decision. Retaining them, or running the `keep_official_play`
   sensitivity, first requires recovering `los_x` for them, e.g. from the ball
   position at the snap.
-- **Corridor width**: 2 yd or 3 yd.
 - **Robustness**: refit with `PLAYER_S_MAX` at $9.22$ and $9.98$ and report that
   log loss barely moves.
 - **Man/zone** — whether the binary earns a place in the model, given §5 and

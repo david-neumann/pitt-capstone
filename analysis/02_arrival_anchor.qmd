@@ -288,8 +288,8 @@ where `pass_arrived` put it, with p90 around 4.4 and 8.1 yd. The displacement
 is systematically downfield (`p50_dx_ball` positive) and its magnitude depends
 on the outcome.
 
-The passing-window corridor is 2–3 yd wide. An anchor whose p90 error is 8 yd
-cannot define it. The physical story: `pass_outcome_incomplete` fires when the
+The coverage features work at a scale of a couple of yards (separation, a
+defender's reach). An anchor whose p90 error is 8 yd cannot support them. The physical story: `pass_outcome_incomplete` fires when the
 ball hits the turf, which is well past the receiver.
 
 :::
@@ -1094,4 +1094,5 @@ existed; all pass (`notes/decisions.md` §6.9):
 
 **Since resolved** (`notes/decisions.md` §4.8, §7): `keep_arrival` is a
 diagnostic only, the beyond-the-LOS threshold is $\text{depth}_{\text{arr}} > 0$,
-and `qb_hit` is a covariate. Corridor width remains open.
+and `qb_hit` is a covariate. The passing window is time-based rather than a
+fixed-width corridor.
