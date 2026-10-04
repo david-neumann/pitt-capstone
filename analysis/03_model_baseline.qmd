@@ -695,5 +695,108 @@ This is the number stages 3 and 4 have to improve on. Whether a difference of a
 given size is distinguishable from fold-to-fold noise is a question for the
 paired interval, which follows.
 
-Sections 6 through 8 — $\Delta$ log loss with a clustered interval, calibration,
-and the `cp` benchmark — follow.
+# 6. Paired $\Delta$ log loss
+
+## 6.1 The estimator
+
+Two stages are compared on the same plays, so the comparison is paired. For each
+play,
+
+$$
+d_i = \ell_i^{(b)} - \ell_i^{(a)}, \qquad
+\Delta = \frac{1}{n}\sum_{i=1}^{n} d_i = \text{LL}^{(b)} - \text{LL}^{(a)},
+$$
+
+where $\ell_i$ is the per-play log loss of §5.1. Negative $\Delta$ favours stage
+$b$. Pairing removes the variation in difficulty that both stages share, so the
+interval on $\Delta$ is far narrower than intervals on the two log losses
+separately would suggest.
+
+Plays are not independent, so the interval resamples **clusters** rather than
+plays. With clusters $g = 1, \dots, G$, cluster sums $S_g = \sum_{i \in g} d_i$
+and sizes $n_g$, each bootstrap draw samples $G$ clusters with replacement and
+computes
+
+$$
+\Delta^{*} = \frac{\sum_{g \in \text{draw}} S_g}{\sum_{g \in \text{draw}} n_g},
+$$
+
+and the 95% interval is the 2.5th and 97.5th percentiles of $10{,}000$ draws.
+The interval holds the out-of-fold predictions fixed: it measures how much
+$\Delta$ would vary across samples of plays, not across refits.
+
+Two clusterings are reported. **Game** (253 clusters) is the primary choice:
+plays within a game share a quarterback, a defense, and conditions. **Week** (17
+clusters) matches the cross-validation folds, but 17 is too few for a percentile
+bootstrap to be reliable, so it is a sensitivity check. As cross-checks,
+`se_cluster` is the analytic cluster-robust standard error,
+
+$$
+\widehat{\text{SE}} = \frac{1}{n}\sqrt{\frac{G}{G-1}\sum_{g}\big(S_g - n_g\,\Delta\big)^2},
+$$
+
+which should agree with the bootstrap standard error, and `se_iid` ignores
+clustering altogether.
+
+## 6.2 Stage 2 against stage 1
+
+```{r}
+#| label: paired-delta
+
+deltas <- bind_rows(
+  paired_delta(preds, "1. intercept", "2. play-by-play", cluster = "game_id"),
+  paired_delta(preds, "1. intercept", "2. play-by-play", cluster = "week")
+)
+
+# The paired mean is exactly the difference of the §5.1 log losses.
+stopifnot(isTRUE(all.equal(
+  deltas$estimate,
+  rep(diff(scores$log_loss), 2)
+)))
+
+deltas |>
+  mutate(design_effect = (se_cluster / se_iid)^2) |>
+  select(
+    cluster,
+    n_clusters,
+    estimate,
+    conf_low,
+    conf_high,
+    se_boot,
+    se_cluster,
+    se_iid,
+    design_effect
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Stage 2 minus stage 1, out-of-fold log loss",
+    subtitle = "Cluster bootstrap, 10,000 draws, 95% percentile interval"
+  ) |>
+  fmt_number(columns = c(estimate, conf_low, conf_high), decimals = 4) |>
+  fmt_number(columns = c(se_boot, se_cluster, se_iid), decimals = 5) |>
+  fmt_number(columns = design_effect, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+**Stage 2 improves on stage 1 by $0.062$ nats, 95% interval
+$[-0.0673, -0.0570]$ clustering by game.** The interval is about 24 standard
+errors from zero, so the baseline's improvement over the base rate is not in
+question.
+
+**The bootstrap is consistent with the analytic standard error** to three
+significant figures under game clustering ($0.00261$ against $0.00261$), which is
+the check that the resampling code is right.
+
+**Clustering barely matters for this comparison.** The design effect is $0.99$
+for games: the paired differences show no detectable within-game correlation,
+because game-level factors that make plays harder or easier affect both stages'
+losses alike and cancel in $d_i$. The week figure ($0.89$) is within the noise of
+a standard error estimated from 17 clusters, whose own relative error is roughly
+$1/\sqrt{2(G-1)} \approx 18\%$; it does not indicate that weeks behave
+differently from games.
+
+This need not hold for stages 3 and 4. Coverage features are partly team-level,
+so their improvements over stage 2 could be concentrated in particular games,
+and game clustering is retained so the interval would widen if they are.
+
+Sections 7 and 8 — calibration and the `cp` benchmark — follow.

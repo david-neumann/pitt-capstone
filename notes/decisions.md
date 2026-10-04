@@ -661,6 +661,16 @@ air-yards buckets.
   those plays. Present on 2,761 plays (14.4%).
 - **`qb_spike` (75 plays) and `qb_scramble` (7 plays) are population filters,
   not features.** Neither is an attempted pass. They belong in the `08` funnel.
+- **Resampling unit for $\Delta$ log loss intervals: game.** Plays within a
+  game share a quarterback, a defense, and conditions; 253 clusters support a
+  percentile bootstrap, where week's 17 do not. Week is reported alongside as a
+  sensitivity check. Intervals hold the out-of-fold predictions fixed
+  (`paired_delta()`, 10,000 draws). On stage 2 against stage 1 (17,074 plays):
+  $\Delta = -0.0621$, game 95% interval $[-0.0673, -0.0570]$, week
+  $[-0.0666, -0.0573]$. Design effect $0.99$ by game and $0.89$ by week, the
+  latter within the noise of a 17-cluster estimate: clustering is immaterial
+  for this comparison but is retained because stage 3–4 gains may concentrate
+  by game.
 
 **Immediate decisions still open.**
 

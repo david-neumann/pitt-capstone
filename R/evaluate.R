@@ -19,6 +19,7 @@
 #   fit_full()              one fit on all rows, for interpretation
 #   pointwise_log_loss()    per-play log loss
 #   log_loss()              mean log loss
+#   paired_delta()          paired difference with a cluster bootstrap
 #
 # mgcv must be attached (library(mgcv)) before fitting, because the spec
 # formulas use bare s().
@@ -425,4 +426,99 @@ pointwise_log_loss <- function(y, p) {
 #' @inheritParams pointwise_log_loss
 log_loss <- function(y, p) {
   mean(pointwise_log_loss(y, p))
+}
+
+
+#' Paired difference in log loss between two stages, with a cluster
+#' bootstrap interval
+#'
+#' For each play, d_i = loss under `model` minus loss under `reference`;
+#' the estimate is mean(d_i), so negative values favour `model`. Pairing
+#' removes the play-level difficulty both stages share.
+#'
+#' The interval resamples whole clusters with replacement and is the
+#' percentile interval of the resampled means (each the sum of d_i over
+#' the drawn clusters divided by the number of plays drawn). It treats
+#' the out-of-fold predictions as fixed, so it reflects sampling
+#' variability in the plays, not refitting variability. Percentile
+#' intervals are too narrow when clusters are few.
+#'
+#' Two standard errors are reported for comparison: `se_cluster`, the
+#' analytic cluster-robust standard error of a mean, which should be
+#' close to `se_boot`; and `se_iid`, which ignores clustering.
+#'
+#' @param preds Output of cv_predict_all(): one row per (play, model)
+#'   with `game_id`, `play_id`, `complete`, `.pred`, `model`, and the
+#'   cluster column.
+#' @param reference,model Values of `preds$model` to compare.
+#' @param cluster Name of the column defining resampling clusters.
+#' @param B Bootstrap resamples.
+#' @param level Interval coverage.
+#' @param seed RNG seed, applied locally.
+#' @return A one-row tibble: `reference`, `model`, `cluster`,
+#'   `n_clusters`, `n`, `estimate`, `conf_low`, `conf_high`, `se_boot`,
+#'   `se_cluster`, `se_iid`.
+paired_delta <- function(
+  preds,
+  reference,
+  model,
+  cluster = "game_id",
+  B = 10000,
+  level = 0.95,
+  seed = 1961
+) {
+  stopifnot(
+    length(cluster) == 1L,
+    cluster %in% names(preds),
+    all(c(reference, model) %in% preds$model),
+    B >= 1000,
+    level > 0 && level < 1
+  )
+
+  keys <- c("game_id", "play_id")
+  ref <- preds[preds$model == reference, unique(c(keys, cluster, "complete", ".pred"))]
+  mod <- preds[preds$model == model, c(keys, "complete", ".pred")]
+
+  paired <- dplyr::inner_join(ref, mod, by = keys, suffix = c("_ref", "_mod"))
+
+  # Both stages must be scored on exactly the same plays and outcomes.
+  stopifnot(
+    nrow(paired) == nrow(ref),
+    nrow(paired) == nrow(mod),
+    identical(paired$complete_ref, paired$complete_mod),
+    !anyNA(paired[[cluster]])
+  )
+
+  d <- pointwise_log_loss(paired$complete_mod, paired$.pred_mod) -
+    pointwise_log_loss(paired$complete_ref, paired$.pred_ref)
+  g <- paired[[cluster]]
+
+  sums <- as.numeric(rowsum(d, g))
+  sizes <- as.numeric(rowsum(rep(1, length(d)), g))
+  n_g <- length(sums)
+  n <- length(d)
+  estimate <- mean(d)
+
+  draws <- withr::with_seed(seed, {
+    idx <- matrix(sample.int(n_g, n_g * B, replace = TRUE), nrow = B)
+    rowSums(matrix(sums[idx], nrow = B)) /
+      rowSums(matrix(sizes[idx], nrow = B))
+  })
+
+  alpha <- 1 - level
+  ci <- stats::quantile(draws, c(alpha / 2, 1 - alpha / 2), names = FALSE)
+
+  tibble::tibble(
+    reference = reference,
+    model = model,
+    cluster = cluster,
+    n_clusters = n_g,
+    n = n,
+    estimate = estimate,
+    conf_low = ci[1],
+    conf_high = ci[2],
+    se_boot = stats::sd(draws),
+    se_cluster = sqrt(n_g / (n_g - 1) * sum((sums - sizes * estimate)^2)) / n,
+    se_iid = stats::sd(d) / sqrt(n)
+  )
 }
