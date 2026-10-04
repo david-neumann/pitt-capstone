@@ -68,15 +68,12 @@ than in a footnote.
 Nothing is written to disk, so the architectural rule holds, but these results
 are not yet reproducible from a build artifact.
 
-**One of the question's population filters is applied, inline in §1.2**: a
-targeted receiver (`notes/decisions.md` §4.9). Spikes and scrambles are already
-absent from the analytic sample. The beyond-the-line-of-scrimmage filter
-($\text{depth}_{\text{arr}} > 0$, `notes/decisions.md` §7) is **not yet**
-applied; it arrives with the tracking-derived depth when `08` assembles the
-model frame. It will remove roughly a fifth of these plays, which changes every
-number below. Stage 3 and 4
-features do not exist yet either, so what follows is the **floor and the
-baseline**, plus the external benchmark. The thesis is untested.
+**The question's population filters are applied inline, in §1.2**: a targeted
+receiver (`notes/decisions.md` §4.9) and a ball that arrives beyond the line of
+scrimmage ($\text{depth}_{\text{arr}} > 0$, §7). Spikes and scrambles are
+already absent from the analytic sample. §1–8 report the floor, the
+play-by-play baseline, and the external benchmark; §9 adds stage 3, separation
+at the throw. Stage 4 features do not exist yet.
 
 :::
 
@@ -90,6 +87,8 @@ analytic_sample <- read_parquet(here(
 ))
 plays <- read_parquet(here("data", "processed", "plays.parquet"))
 pbp <- read_parquet(here("data", "processed", "pbp.parquet"))
+arrival <- read_parquet(here("data", "processed", "arrival.parquet"))
+features <- read_parquet(here("data", "processed", "features.parquet"))
 
 # pbp.parquet does not carry receiver names yet, so they are read from the
 # nflverse mirror. 08 takes this over.
@@ -104,7 +103,7 @@ receivers <- read_parquet(
 
 ## 1.1 Assembly
 
-Four sources, joined on `(game_id, play_id)`. The join takes from each table
+Six sources, joined on `(game_id, play_id)`. The join takes from each table
 only the columns the other two lack, because `analytic_sample.parquet` already
 carries `down`, `yards_to_go`, `los_x`, and `week` — pulling them again would
 produce suffixed `.x` / `.y` pairs rather than an error.
@@ -112,10 +111,14 @@ produce suffixed `.x` / `.y` pairs rather than an error.
 - `analytic_sample.parquet` — the spine, and the response via `pass_result`
 - `plays.parquet` — `number_of_pass_rushers`, which `04_build_sample.R` did not
   carry forward because the sample rule did not need it
-- `pbp.parquet` — `air_yards`, `pass_location`, `qb_hit`, `shotgun`,
+- `pbp.parquet` — `pass_location`, `qb_hit`, `shotgun`, charted `air_yards`
+  (kept for comparison only),
   `posteam_type`, and the benchmark columns `cp` / `has_cp`
 - the nflverse mirror — `receiver_player_name`, for the population filter in
   §1.2
+- `arrival.parquet` — `depth_arr`, the tracking-derived depth that replaces
+  charted `air_yards` (`notes/decisions.md` §6.9), and the arrival diagnostics
+- `features.parquet` — the stage 3 features (§9)
 
 `plays.parquet` is not widened by re-running `04`: the analytical sample is a
 locked artifact of the sample layer, and adding model covariates to it would
@@ -131,6 +134,14 @@ throws <- analytic_sample |>
   ) |>
   left_join(pbp, by = c("game_id", "play_id")) |>
   left_join(receivers, by = c("game_id", "play_id")) |>
+  left_join(
+    select(arrival, game_id, play_id, depth_arr, used_fallback, at_window_edge),
+    by = c("game_id", "play_id")
+  ) |>
+  left_join(
+    select(features, game_id, play_id, sep_throw, closing_throw),
+    by = c("game_id", "play_id")
+  ) |>
   filter(pass_result %in% c("C", "I", "IN"))
 
 tibble(
@@ -162,17 +173,22 @@ rule defines the population as plays where a forward pass was *released*
 of plays; this filter is on the outcome code rather than the event, so it
 catches those.
 
-## 1.2 Population: a targeted receiver
+## 1.2 Population: a targeted receiver, beyond the line
 
 nflverse computes `cp` only when a receiver is named, and the question is the
 completion probability of a pass *to a receiver*. Throwaways, intentional
 grounding, and passes with no identifiable target are out of scope
-(`notes/decisions.md` §4.9). Two steps, applied here until
+(`notes/decisions.md` §4.9). The question is also about passes thrown beyond
+the line of scrimmage; screens and other throws at or behind it have different
+coverage dynamics (§7). Four steps, applied here until
 `scripts/08_build_model_frame.R` exists:
 
 - **Population:** nflverse names a receiver.
 - **Quality:** BDB's targeted receiver is tracked. Without that, no coverage
   geometry can be measured.
+- **Quality:** an arrival is measured (`arrival.parquet`).
+- **Population:** the ball arrives beyond the line,
+  $\text{depth}_{\text{arr}} > 0$.
 
 Like every exclusion, each step is checked for a differential completion rate.
 
@@ -189,15 +205,19 @@ pop <- throws |>
 everything <- rep(TRUE, nrow(pop))
 named <- pop$receiver_named
 tracked <- named & pop$target_tracked
+arrived <- tracked & !is.na(pop$depth_arr)
+beyond <- arrived & pop$depth_arr > 0
 
 pop_funnel <- tibble(
   step = c(
     "thrown passes",
     "nflverse receiver named (population)",
-    "targeted receiver tracked (quality)"
+    "targeted receiver tracked (quality)",
+    "arrival measured (quality)",
+    "ball arrives beyond the line (population)"
   ),
-  keep = list(everything, named, tracked),
-  before = list(everything, everything, named)
+  keep = list(everything, named, tracked, arrived, beyond),
+  before = list(everything, everything, named, tracked, arrived)
 ) |>
   mutate(
     dropped = map2_int(before, keep, \(b, k) sum(b & !k)),
@@ -218,7 +238,7 @@ pop_funnel |>
   sub_missing(missing_text = "") |>
   gt_theme_538(quiet = TRUE)
 
-model_input <- filter(pop, receiver_named, target_tracked)
+model_input <- pop[beyond, ]
 
 # The benchmark is defined on every play in the population.
 stopifnot(all(model_input$has_cp))
@@ -231,12 +251,20 @@ population, not attrition, and it is the same exclusion nflverse makes for
 `cp`. The `r pop_funnel$dropped[3]` targeted receivers who are not tracked
 complete at `r percent(pop_funnel$complete_dropped[3], accuracy = 0.1)`, the
 opposite skew. That is a measurement loss, small enough to state rather than
-correct. Every play that remains carries `cp`, so the stages and the benchmark
-are scored on the same rows.
+correct. `r pop_funnel$dropped[4]` more have no measured arrival.
+
+The beyond-the-line filter removes `r comma(pop_funnel$dropped[5])` throws,
+which complete at `r percent(pop_funnel$complete_dropped[5], accuracy = 0.1)`
+against `r percent(pop_funnel$complete_kept[5], accuracy = 0.1)` for those kept:
+screens and other throws at the line are easy completions. It is a population
+definition, stated with its composition.
+
+Every play that remains carries `cp`, so the stages and the benchmark are scored
+on the same rows.
 
 ## 1.3 Derived predictors
 
-`prepare_model_frame()` in `R/evaluate.R` owns the response and three derived
+`prepare_model_frame()` in `R/evaluate.R` owns the response and two derived
 columns, so that every stage and the benchmark see identical inputs. The
 reasoning for each is in that file's header; the observable effects:
 
@@ -249,8 +277,7 @@ tibble(
   transformation = c(
     "response: complete = 1 for C, 0 for I and IN",
     "number_of_pass_rushers clamped to [2, 7]",
-    "dist_to_sticks = air_yards - yards_to_go",
-    "air_yards_zero: plays at exactly 0 air yards",
+    "dist_to_sticks = depth_arr - yards_to_go",
     "home = posteam_type == 'home'"
   ),
   affected = c(
@@ -260,7 +287,6 @@ tibble(
       na.rm = TRUE
     ),
     sum(!is.na(mf$dist_to_sticks)),
-    sum(mf$air_yards_zero, na.rm = TRUE),
     sum(mf$home, na.rm = TRUE)
   )
 ) |>
@@ -307,9 +333,11 @@ rep$by_column |>
   gt_theme_538(quiet = TRUE)
 ```
 
-`r n_incomplete` plays in this population are missing a required variable.
-Before the targeted-receiver filter there were three (`notes/decisions.md`
-§9.1); none of them passes §1.2. The check stays as a tripwire.
+`r n_incomplete` plays in this population are missing a required variable:
+`closing_throw` is undefined where the direction of the receiver or the nearest
+defender is missing at the throw (`scripts/07_build_features.R`). The
+requirement is the union across all specs, so these plays leave every stage,
+not just stage 3. Their outcome composition is below.
 
 ```{r}
 #| label: incomplete-composition
@@ -441,19 +469,13 @@ pt |>
   gt_theme_538(quiet = TRUE)
 ```
 
-Two of these are worth reporting as findings rather than as controls. A third,
-`qb_hit`, is no longer a single coefficient; see §3.2.
+One of these is worth reporting as a finding rather than a control. `qb_hit` is
+no longer a single coefficient; see §3.2.
 
-**`air_yards_zero` at `r b("air_yards_zero")` on the logit scale**, against an
-intercept of `r b("(Intercept)")`: a throw at exactly zero air yards has
-`r sprintf("%.2f", exp(pt["air_yards_zero", "Estimate"]))` times the odds of
-completion of one nearby on either side. nflverse describes this indicator as a
-relic of its pre-tree models, and for a tree it is — a tree can split at exactly
-$0$. A penalized spline cannot; it smooths straight over a point mass of
-`r comma(sum(mf_complete$air_yards_zero))` plays. When the indicator was added
-during specification (`notes/decisions.md` §9.3), the effective degrees of
-freedom on `s(air_yards)` rose from $4.37$ to $7.67$ and deviance explained
-improved on a strictly smaller model.
+Depth is the tracking-derived $\text{depth}_{\text{arr}}$, not charted
+`air_yards`. The earlier `air_yards == 0` indicator is gone with it: it captured
+the charting convention of recording throws at the line as exactly zero
+(`notes/decisions.md` §6.9), and the tracking depth is continuous.
 
 **`shotgun` at `r b("shotgun", digits = 3)`** (SE
 `r b("shotgun", "Std. Error", 3)`), which is the opposite sign from the
@@ -496,7 +518,7 @@ st |>
 `s(dist_to_sticks)` comes back weak: `edf`
 `r sprintf("%.2f", st["s(dist_to_sticks)", "edf"])`,
 $p$ = `r sprintf("%.2f", st["s(dist_to_sticks)", "p-value"])`. The motivation was
-sound — additive smooths in `air_yards` and `yards_to_go` cannot represent their
+sound — additive smooths in depth and `yards_to_go` cannot represent their
 difference, which is an interaction, and a 3-yard throw on 3rd-and-2 is a
 different play from a 3-yard throw on 3rd-and-15 — but the data give it little
 support. Conditional on depth, whether the throw reaches the line to
@@ -512,7 +534,7 @@ It also spans the `yards_to_go` direction, so dropping it would remove that
 variable from the model entirely.
 
 **The QB-hit effect varies with depth.** `qb_hit` enters as
-`s(air_yards, by = qb_hit)`: a smooth in air yards that applies only to plays
+`s(depth_arr, by = qb_hit)`: a smooth in depth that applies only to plays
 with a hit, so the hit's effect on the logit is a function of depth. A
 diagnosis of an earlier specification, which held the hit effect constant,
 found its effect fading from about $-1.6$ behind the line to about $-0.3$ on
@@ -524,29 +546,28 @@ on deep throws the hit more often comes after the release.
 ```{r}
 #| label: hit-by-depth
 
-hit_depths <- c(0, 10, 20, 30)
+hit_depths <- c(2, 10, 20, 30)
 hit_nd <- mf_complete[rep(1, length(hit_depths)), ] |>
-  mutate(air_yards = hit_depths, qb_hit = 1)
+  mutate(depth_arr = hit_depths, qb_hit = 1)
 hit_tm <- predict(f2, newdata = hit_nd, type = "terms", se.fit = TRUE)
 hit_eff <- tibble(
-  air_yards = hit_depths,
-  effect = hit_tm$fit[, "s(air_yards):qb_hit"],
-  se = hit_tm$se.fit[, "s(air_yards):qb_hit"]
+  depth_arr = hit_depths,
+  effect = hit_tm$fit[, "s(depth_arr):qb_hit"],
+  se = hit_tm$se.fit[, "s(depth_arr):qb_hit"]
 )
 
 hit_eff |>
   gt() |>
-  tab_header(title = "Effect of a QB hit on the logit, by air yards") |>
+  tab_header(title = "Effect of a QB hit on the logit, by depth") |>
   fmt_number(columns = c(effect, se), decimals = 2) |>
   gt_theme_538(quiet = TRUE)
 
-he <- function(a) sprintf("%.2f", hit_eff$effect[hit_eff$air_yards == a])
+he <- function(a) sprintf("%.2f", hit_eff$effect[hit_eff$depth_arr == a])
 ```
 
-A hit lowers the logit by `r he(0)` at the line of scrimmage, `r he(10)` at 10
-yards, and `r he(20)` at 20 yards. Beyond about 35 yards the fitted effect turns
-slightly positive, which is implausible but indistinguishable from zero: few hit
-plays reach that depth and the band is wide (see the smooth plots below).
+A hit changes the logit by `r he(2)` at 2 yards, `r he(10)` at 10 yards,
+`r he(20)` at 20 yards, and `r he(30)` at 30. The band widens at the deep end,
+where few hit plays reach (see the smooth plots below).
 
 Including `qb_hit` at all, rather than excluding hit plays, follows
 `notes/decisions.md` §7: the flag does not distinguish "hit during the throw"
@@ -646,7 +667,8 @@ anything.
 ```{r}
 #| label: cv-predict
 
-preds <- cv_predict_all(mf_complete, folds, verbose = FALSE)
+# Stages 1 and 2 here; stage 3 is cross-validated in §9.
+preds <- cv_predict_all(mf_complete, folds, specs = MODEL_SPECS[1:2], verbose = FALSE)
 pred_mean <- tapply(preds$.pred, preds$model, mean)
 s1_range <- range(preds$.pred[preds$model == "1. intercept"])
 s2_range <- range(preds$.pred[preds$model == "2. play-by-play"])
@@ -920,9 +942,9 @@ baseline's improvement over the base rate is not in question.
 (`r sprintf("%.5f", dg$se_boot)` against `r sprintf("%.5f", dg$se_cluster)`),
 which is the check that the resampling code is right.
 
-**Clustering barely matters for this comparison.** The design effect is
-`r deff(dg)` for games: the paired differences show no detectable within-game
-correlation, because game-level factors that make plays harder or easier affect
+**Clustering matters little for this comparison.** The design effect is
+`r deff(dg)` for games: within-game correlation in the paired differences is
+small, because game-level factors that make plays harder or easier affect
 both stages' losses alike and cancel in $d_i$. The week figure (`r deff(dw)`) is
 within the noise of a standard error estimated from 17 clusters, whose own
 relative error is roughly $1/\sqrt{2(G-1)} \approx 18\%$; it does not indicate
@@ -1088,20 +1110,22 @@ p_cal
 `r cs("2. play-by-play", "slope", "conf_high")`]. A slope this close to 1 out of
 fold says the spread of stage 2's predictions is earned rather than overfit.
 
-**`cp` is also well calibrated on this population**: CITL `r cs("cp", "citl")`
-[`r cs("cp", "citl", "conf_low")`, `r cs("cp", "citl", "conf_high")`], slope
-`r cs("cp", "slope")` [`r cs("cp", "slope", "conf_low")`,
-`r cs("cp", "slope", "conf_high")`]. Partly in-sample for 2018, it would be
-surprising if it were not.
+**`cp` is close to calibrated but not quite, on this population**: CITL
+`r cs("cp", "citl")` [`r cs("cp", "citl", "conf_low")`,
+`r cs("cp", "citl", "conf_high")`] and slope `r cs("cp", "slope")`
+[`r cs("cp", "slope", "conf_low")`, `r cs("cp", "slope", "conf_high")`]. On
+throws beyond the line of scrimmage it slightly underpredicts completion, and
+its predictions are slightly too timid. `cp` was fit to all passes, including
+the screens and other short throws removed here, so some miscalibration on a
+subpopulation is expected.
 
-## 7.3 Within air-yards buckets
+## 7.3 Within depth buckets
 
 Overall calibration can hide offsetting errors in subgroups. Depth is the
 natural first split, since it is the strongest predictor and since tracking
-features will be reported against it. Bucket edges are fixed in advance:
-at or behind the line, short (1–9), intermediate (10–19), and deep (20+). The
-"$\le 0$" bucket will empty once the beyond-the-line-of-scrimmage filter is
-applied. Separation buckets follow once stage 3 exists.
+features are reported against it. Bucket edges on
+$\text{depth}_{\text{arr}}$ are fixed in advance (`depth_bucket()`): short
+(0–10 yd), intermediate (10–20), and deep (20+).
 
 ```{r}
 #| label: calibration-buckets
@@ -1109,10 +1133,10 @@ applied. Separation buckets follow once stage 3 exists.
 with_bucket <- preds_all |>
   filter(model %in% calib_models) |>
   left_join(
-    select(mf_complete, game_id, play_id, air_yards),
+    select(mf_complete, game_id, play_id, depth_arr),
     by = c("game_id", "play_id")
   ) |>
-  mutate(bucket = air_yards_bucket(air_yards))
+  mutate(bucket = droplevels(depth_bucket(depth_arr)))
 
 stopifnot(!anyNA(with_bucket$bucket))
 
@@ -1133,7 +1157,7 @@ by_bucket |>
   pivot_wider(names_from = stat, values_from = value) |>
   gt(groupname_col = "model") |>
   tab_header(
-    title = "Calibration by air-yards bucket",
+    title = "Calibration by depth bucket",
     subtitle = "Game-cluster bootstrap, 1,000 draws, 95% percentile interval"
   ) |>
   fmt_number(columns = n, decimals = 0) |>
@@ -1175,7 +1199,7 @@ p_cal_bucket <- ggplot(bucket_bins, aes(mean_pred, obs_rate)) +
   scale_x_continuous(labels = percent_format(accuracy = 1)) +
   scale_y_continuous(labels = percent_format(accuracy = 1)) +
   labs(
-    title = "Calibration within air-yards buckets",
+    title = "Calibration within depth buckets",
     subtitle = "10 equal-count bins per bucket",
     x = "predicted P(complete)",
     y = "observed completion rate"
@@ -1183,7 +1207,7 @@ p_cal_bucket <- ggplot(bucket_bins, aes(mean_pred, obs_rate)) +
   theme_minimal()
 
 ggsave(
-  here("figs", "week06", "calibration_by_air_yards.png"),
+  here("figs", "week06", "calibration_by_depth.png"),
   p_cal_bucket,
   width = 9,
   height = 5.5,
@@ -1193,32 +1217,29 @@ ggsave(
 p_cal_bucket
 ```
 
-**Calibration-in-the-large holds in every bucket**, for both stage 2 and `cp`:
-each CITL interval contains zero.
+**Stage 2's calibration-in-the-large holds in every bucket**: each CITL
+interval contains zero. `cp` underpredicts on short throws
+(`r sprintf("%.3f", bk("cp", "0-10", "citl"))`
+[`r sprintf("%.3f", bk("cp", "0-10", "citl", "conf_low"))`,
+`r sprintf("%.3f", bk("cp", "0-10", "citl", "conf_high"))`]).
 
-**Deep throws remain stage 2's weakest bucket.** Within 20+
-(`r comma(bk("2. play-by-play", "20+", "citl", "n"))` plays) its slope is
+**Stage 2's slopes are within sampling error of 1 except at intermediate
+depth**, where its predictions are slightly too timid
+(`r sprintf("%.3f", bk("2. play-by-play", "10-20", "slope"))`
+[`r sprintf("%.3f", bk("2. play-by-play", "10-20", "slope", "conf_low"))`,
+`r sprintf("%.3f", bk("2. play-by-play", "10-20", "slope", "conf_high"))`]). On
+deep throws the slope is
 `r sprintf("%.2f", bk("2. play-by-play", "20+", "slope"))`
 [`r sprintf("%.2f", bk("2. play-by-play", "20+", "slope", "conf_low"))`,
-`r sprintf("%.2f", bk("2. play-by-play", "20+", "slope", "conf_high"))`],
-against `r sprintf("%.2f", bk("cp", "20+", "slope"))`
+`r sprintf("%.2f", bk("2. play-by-play", "20+", "slope", "conf_high"))`]; on
+the earlier specification, with charted air yards, a constant QB-hit effect, and
+throws behind the line included, it was $0.62$ [$0.41$, $0.84$]
+(`notes/decisions.md` §9.6). `cp` is too timid on deep throws
+(`r sprintf("%.2f", bk("cp", "20+", "slope"))`
 [`r sprintf("%.2f", bk("cp", "20+", "slope", "conf_low"))`,
-`r sprintf("%.2f", bk("cp", "20+", "slope", "conf_high"))`] for `cp`. Before
-the QB-hit effect was allowed to vary with depth (§3.2), the stage 2 slope in
-this bucket was $0.62$ [$0.41$, $0.84$] (`notes/decisions.md` §9.6); the
-interaction removes part of the excess spread. A smaller, separate misfit
-remains: deep throws from inside the opponent's 30, which land in or near the
-end zone, complete less often than stage 2 predicts.
+`r sprintf("%.2f", bk("cp", "20+", "slope", "conf_high"))`]).
 
-Stage 2's slope in the behind-the-line bucket is
-`r sprintf("%.2f", bk("2. play-by-play", "<= 0", "slope"))`
-[`r sprintf("%.2f", bk("2. play-by-play", "<= 0", "slope", "conf_low"))`,
-`r sprintf("%.2f", bk("2. play-by-play", "<= 0", "slope", "conf_high"))`]; that
-bucket leaves the population with the beyond-the-line-of-scrimmage filter.
-
-Deep throws are where stage 2 is weakest, so they are where stages 3 and 4 have
-the most room. The stage 3–4 comparison is reported by depth as well as
-overall.
+The stage 3–4 comparison is reported by depth as well as overall.
 
 # 8. The `cp` benchmark
 
@@ -1275,12 +1296,305 @@ nats and stage 2 `r sprintf("%.4f", -dg$estimate)`, so stage 2 captures
 `r percent(dg$estimate / dcp1$estimate, accuracy = 1)` of `cp`'s improvement
 over the base rate.
 
-Both are well calibrated (§7.2), so the gap is in discrimination: `cp` ranks
-plays better. Several plausible sources, none separable here: its model class
-can represent interactions that stage 2's additive smooths cannot, it is trained
-on far more plays, and 2018 is partly in its training data.
+`cp` leads despite being slightly miscalibrated on this population (§7.2), so
+the gap is in discrimination: `cp` ranks plays better. Several plausible
+sources, none separable here: its model class can represent interactions that
+stage 2's additive smooths cannot, it is trained on far more plays, and 2018 is
+partly in its training data.
 
 The gap is the reference point for stages 3 and 4. If coverage geometry closes
 it, tracking matches the field standard with a simpler model class; if
 geometry's improvement over stage 2 exceeds it, tracking adds more than the
 field-standard play-by-play model does.
+
+# 9. Stage 3: separation at the throw
+
+## 9.1 The features
+
+Both are measured at the throw frame, from `scripts/07_build_features.R`. With
+$\mathbf{x}_r$ the targeted receiver's position and $D$ the tracked defenders,
+the nearest defender is
+$j^* = \arg\min_{j \in D} \lVert \mathbf{x}_j - \mathbf{x}_r \rVert$ and
+
+$$
+\text{sep} = \lVert \mathbf{x}_{j^*} - \mathbf{x}_r \rVert,
+\qquad
+\dot{\text{sep}} =
+\frac{(\mathbf{v}_{j^*} - \mathbf{v}_r) \cdot (\mathbf{x}_{j^*} - \mathbf{x}_r)}{\text{sep}},
+$$
+
+where velocities come from speed and direction (`velocity_xy()`). Closing speed
+is negative when the defender is gaining on the receiver. It is computed from
+the instantaneous velocities rather than by differencing positions, so it is
+defined at a single frame.
+
+Design choices:
+
+- **At the throw**, because the question is the completion probability at the
+  moment of release. Separation at arrival is partly the catch itself.
+- **The nearest defender**, not an assigned one: assignment needs coverage
+  labels, which exist for week 1 only (`notes/decisions.md` §3).
+- **Smooths** in both, since separation's effect should flatten once a receiver
+  is clearly open.
+- **A separation-by-depth interaction**, `ti(sep_throw, depth_arr)`. On a deep
+  throw the ball is in the air long enough for separation at the release to
+  change before it arrives, so separation should matter less. Without the
+  interaction, stage 3 applied separation's full-sample effect to deep throws
+  and was too extreme there (calibration slope 0.73 [0.59, 0.86] on 20+ yd;
+  `notes/decisions.md` §9.8).
+
+Stage 3 is stage 2 plus `s(sep_throw)`, `s(closing_throw)`, and
+`ti(sep_throw, depth_arr)`, so the comparison is nested: any improvement is
+credited to separation alone.
+
+```{r}
+#| label: sep-descriptive
+
+mf_complete |>
+  mutate(
+    separation = cut(
+      sep_throw,
+      c(0, 1, 2, 3, 5, 8, Inf),
+      labels = c("0-1", "1-2", "2-3", "3-5", "5-8", "8+")
+    )
+  ) |>
+  group_by(separation) |>
+  summarize(plays = n(), completion = mean(complete), .groups = "drop") |>
+  gt() |>
+  tab_header(title = "Completion rate by separation at the throw (yd)") |>
+  fmt_number(columns = plays, decimals = 0) |>
+  fmt_percent(columns = completion, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+## 9.2 Stage 3, interpreted
+
+```{r}
+#| label: stage3-fit
+
+f3 <- fit_full(mf_complete, MODEL_SPECS[["3. + separation"]])
+st3 <- summary(f3)$s.table
+sep_rows <- c("s(sep_throw)", "s(closing_throw)", "ti(sep_throw,depth_arr)")
+
+st3[sep_rows, , drop = FALSE] |>
+  as.data.frame() |>
+  rownames_to_column("smooth") |>
+  rename(p = `p-value`) |>
+  gt() |>
+  fmt_number(columns = c(edf, Ref.df, Chi.sq), decimals = 2) |>
+  fmt_scientific(columns = p, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: stage3-smooths
+#| fig-height: 4
+
+par(mfrow = c(1, 3))
+for (i in match(sep_rows, rownames(st3))) {
+  plot(f3, select = i, shade = TRUE, seWithMean = TRUE, scale = 0)
+}
+par(mfrow = c(1, 1))
+```
+
+Deviance explained in-sample rises from
+`r percent(summary(f2)$dev.expl, accuracy = 0.01)` (stage 2) to
+`r percent(summary(f3)$dev.expl, accuracy = 0.01)` (stage 3).
+
+## 9.3 Out of fold
+
+```{r}
+#| label: stage3-cv
+
+preds3 <- cv_predict(
+  mf_complete,
+  folds,
+  MODEL_SPECS[["3. + separation"]],
+  "3. + separation",
+  verbose = FALSE
+)
+preds_s3 <- bind_rows(preds_all, preds3)
+
+ll3 <- preds_s3 |>
+  group_by(model) |>
+  summarize(n = n(), log_loss = log_loss(complete, .pred), .groups = "drop") |>
+  arrange(desc(log_loss))
+
+ll3 |>
+  gt() |>
+  tab_header(title = "Out-of-fold log loss") |>
+  fmt_number(columns = log_loss, decimals = 4) |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+
+d3 <- bind_rows(
+  paired_delta(preds_s3, "2. play-by-play", "3. + separation", "game_id"),
+  paired_delta(preds_s3, "2. play-by-play", "3. + separation", "week"),
+  paired_delta(preds_s3, "cp", "3. + separation", "game_id")
+)
+
+d3 |>
+  mutate(design_effect = (se_cluster / se_iid)^2) |>
+  select(reference, model, cluster, estimate, conf_low, conf_high, se_boot, design_effect) |>
+  gt() |>
+  tab_header(
+    title = "Paired differences in log loss (model minus reference)",
+    subtitle = "Cluster bootstrap, 10,000 draws, 95% percentile interval"
+  ) |>
+  fmt_number(columns = c(estimate, conf_low, conf_high), decimals = 4) |>
+  fmt_number(columns = se_boot, decimals = 5) |>
+  fmt_number(columns = design_effect, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+
+d32 <- d3[d3$reference == "2. play-by-play" & d3$cluster == "game_id", ]
+d3cp <- d3[d3$reference == "cp", ]
+```
+
+**Separation improves on stage 2 by `r sprintf("%.4f", -d32$estimate)` nats**,
+95% interval [`r sprintf("%.4f", d32$conf_low)`,
+`r sprintf("%.4f", d32$conf_high)`] by game. For scale, stage 2's gain over the
+base rate is `r sprintf("%.4f", -dg$estimate)` nats and `cp`'s lead over stage 2
+was `r sprintf("%.4f", d2cp$estimate)` (§8). Against `cp`, stage 3 differs by
+`r sprintf("%+.4f", d3cp$estimate)` [`r sprintf("%+.4f", d3cp$conf_low)`,
+`r sprintf("%+.4f", d3cp$conf_high)`].
+
+## 9.4 By depth
+
+```{r}
+#| label: stage3-by-depth
+
+depth_of <- select(mf_complete, game_id, play_id, depth_arr)
+
+d3_depth <- preds_s3 |>
+  left_join(depth_of, by = c("game_id", "play_id")) |>
+  mutate(bucket = droplevels(depth_bucket(depth_arr))) |>
+  group_split(bucket) |>
+  map(\(d) {
+    paired_delta(d, "2. play-by-play", "3. + separation", "game_id") |>
+      mutate(
+        bucket = as.character(d$bucket[1]),
+        stage2_log_loss = log_loss(
+          d$complete[d$model == "2. play-by-play"],
+          d$.pred[d$model == "2. play-by-play"]
+        )
+      )
+  }) |>
+  list_rbind()
+
+d3_depth |>
+  mutate(share_of_stage2 = -estimate / stage2_log_loss) |>
+  select(bucket, n, stage2_log_loss, estimate, conf_low, conf_high, share_of_stage2) |>
+  gt() |>
+  tab_header(
+    title = "Stage 3 minus stage 2, by depth (yd)",
+    subtitle = "Game-cluster bootstrap, 10,000 draws"
+  ) |>
+  fmt_number(columns = n, decimals = 0) |>
+  fmt_number(columns = c(stage2_log_loss, estimate, conf_low, conf_high), decimals = 4) |>
+  fmt_percent(columns = share_of_stage2, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+
+db <- function(b, col = "estimate") d3_depth[[col]][d3_depth$bucket == b]
+```
+
+**Separation improves on stage 2 at every depth, least on deep throws.** The
+gain is `r sprintf("%.4f", -db("0-10"))` nats on short throws and
+`r sprintf("%.4f", -db("10-20"))` on intermediate ones, about
+`r percent(-db("0-10") / db("0-10", "stage2_log_loss"), accuracy = 1)` and
+`r percent(-db("10-20") / db("10-20", "stage2_log_loss"), accuracy = 1)` of
+stage 2's loss. On throws of 20+ yards it is
+`r sprintf("%.4f", -db("20+"))` [`r sprintf("%.4f", -db("20+", "conf_high"))`,
+`r sprintf("%.4f", -db("20+", "conf_low"))`], about
+`r percent(-db("20+") / db("20+", "stage2_log_loss"), accuracy = 1)`. On a
+deep throw the ball is in the air long enough for separation at the release to
+change substantially before it arrives, so the separation at the throw says less
+about the separation at the catch. That is the gap stage 4's time-based
+features (time to arrival, the passing window) are designed to address.
+
+## 9.5 Calibration
+
+```{r}
+#| label: stage3-calibration
+
+d_s3 <- filter(preds_s3, model == "3. + separation") |>
+  left_join(depth_of, by = c("game_id", "play_id")) |>
+  mutate(bucket = droplevels(depth_bucket(depth_arr)))
+
+cal3 <- bind_rows(
+  calibration_summary(d_s3$complete, d_s3$.pred, d_s3$game_id) |>
+    mutate(bucket = "all"),
+  d_s3 |>
+    group_split(bucket) |>
+    map(\(d) {
+      calibration_summary(d$complete, d$.pred, d$game_id, B = 1000) |>
+        mutate(bucket = as.character(d$bucket[1]))
+    }) |>
+    list_rbind()
+)
+
+cal3 |>
+  filter(stat != "intercept") |>
+  mutate(value = sprintf("%.3f [%.3f, %.3f]", estimate, conf_low, conf_high)) |>
+  select(bucket, n, stat, value) |>
+  pivot_wider(names_from = stat, values_from = value) |>
+  gt() |>
+  tab_header(
+    title = "Stage 3 calibration",
+    subtitle = "Game-cluster bootstrap; 2,000 draws overall, 1,000 per bucket"
+  ) |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+
+c3 <- function(b, stat, col = "estimate") {
+  cal3[[col]][cal3$bucket == b & cal3$stat == stat]
+}
+```
+
+**Stage 3 is calibrated overall** — CITL `r sprintf("%.3f", round(c3("all", "citl"), 3) + 0)`
+[`r sprintf("%.3f", c3("all", "citl", "conf_low"))`,
+`r sprintf("%.3f", c3("all", "citl", "conf_high"))`], slope
+`r sprintf("%.3f", c3("all", "slope"))`
+[`r sprintf("%.3f", c3("all", "slope", "conf_low"))`,
+`r sprintf("%.3f", c3("all", "slope", "conf_high"))`] — so adding two flexible
+smooths did not cost calibration out of fold, and the improvement in §9.3 is
+earned rather than overfit.
+
+**On deep throws** the slope is `r sprintf("%.2f", c3("20+", "slope"))`
+[`r sprintf("%.2f", c3("20+", "slope", "conf_low"))`,
+`r sprintf("%.2f", c3("20+", "slope", "conf_high"))`]. Without the
+separation-by-depth interaction it was 0.73 [0.59, 0.86]: stage 3 applied
+separation's full-sample effect to deep throws, where §9.4 shows it is weaker.
+This is the same pattern as the QB-hit effect before its depth interaction
+(§3.2), and the same remedy.
+
+## 9.6 Summary
+
+```{r}
+#| label: stage3-summary
+
+ll3 |>
+  mutate(
+    vs_intercept = log_loss - log_loss[model == "1. intercept"],
+    vs_stage2 = log_loss - log_loss[model == "2. play-by-play"]
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Out-of-fold log loss, stages 1-3 and cp",
+    subtitle = sprintf(
+      "%s throws beyond the line to a targeted receiver",
+      comma(nrow(mf_complete))
+    )
+  ) |>
+  fmt_number(columns = c(log_loss, vs_intercept, vs_stage2), decimals = 4) |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Separation at the throw — two features and their interaction with depth, added
+to a calibrated play-by-play baseline — lowers out-of-fold log loss by
+`r sprintf("%.4f", -d32$estimate)` nats
+[`r sprintf("%.4f", -d32$conf_high)`, `r sprintf("%.4f", -d32$conf_low)`] and
+moves the model from `r sprintf("%.4f", d2cp$estimate)` nats behind `cp` to
+`r sprintf("%.4f", -d3cp$estimate)` ahead of it. These are provisional numbers:
+the model frame is assembled in this notebook rather than by `08`, and stage 4
+is still to come.

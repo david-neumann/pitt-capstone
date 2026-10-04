@@ -32,7 +32,7 @@ written as a side effect of rendering `analysis/01_eda.qmd`.
 | `04_build_sample.R` | built | Base sample exclusions, via `R/sample_rules.R`. |
 | `05_join_pbp.R` | built | Pulls and mirrors nflverse play-by-play; emits `pbp.parquet` on the plays keys. Measured facts only. |
 | `06_build_throw_frame.R` | built | Applies `R/arrival.R` at season scale; emits `arrival.parquet`, `approach.parquet`, and the throw-frame slice `throw_frame.parquet` (§6.9). Measured facts only; no outcome columns. |
-| `07_build_features.R` | planned | Throw-frame coverage features. |
+| `07_build_features.R` | built (stage 3) | Throw-frame coverage features; emits `features.parquet`. Stage 3 (separation, closing speed) built; stage 4 to be added (§9.8). |
 | `08_build_model_frame.R` | planned | Model-frame assembly, question-level population filters with their own funnel, leak assertions. |
 
 | Helper / notebook | Owns |
@@ -798,8 +798,15 @@ cross-validation. Details in §9.
 - **Resampling unit for $\Delta$ log loss intervals: game** (§9.5).
 - **Calibration method** (§9.6) and **`cp` benchmark method** (§9.7): fixed
   external predictions, no recalibration.
+- **Depth control: $\text{depth}_{\text{arr}}$ replaces charted `air_yards`
+  in stage 2**, and the `air_yards == 0` indicator is dropped (§9.3).
 - **Stage 2 depth interaction: QB hit × depth** (§9.3). Decided before any
   stage 3 result exists. Stage 3–4 results are still reported by depth.
+- **Stage 3 depth interaction: separation × depth**, `ti(sep_throw, depth_arr)`
+  (§9.8). Without it stage 3 was too extreme on deep throws (calibration slope
+  0.73 [0.59, 0.86] on 20+ yd), the same pattern as QB hit before its
+  interaction. Chosen over waiting for stage 4's time-based features, so that
+  stage 3 is calibrated as a baseline for stage 4.
 
 ### Open
 
@@ -814,8 +821,8 @@ cross-validation. Details in §9.
 - **QB kinematic state** — listed among the geometry features in earlier
   framing but not assigned to stage 3 or 4.
 - **`FLAG_GROUP` relabel** for `keep_arrival` (§4.8).
-- **Depth control.** The tracking-derived throw distance replaces `air_yards`
-  in stage 2 once `06` exists; `air_yards` becomes a robustness refit (§9.3).
+- **Robustness: charted `air_yards`.** Refit stage 2 with charted `air_yards`
+  in place of $\text{depth}_{\text{arr}}$ (§9.3).
 - **`receiver_player_name` in `pbp.parquet`.** Add it to `PBP_COLS` and re-run
   `05` (a rebuild of `data/processed/pbp.parquet`, no network) so `08` does not
   read the interim mirror.
@@ -838,10 +845,10 @@ inappropriate for this question:
 
 ### Feature state
 
-`R/geometry.R`, `R/arrival.R`, `R/pbp.R`, `R/evaluate.R`, and scripts 01–06
-exist. `arrival.parquet` and `throw_frame.parquet` are built and validated
-(§6.9). Stages 1 and 2 are fit and scored (§9). No tracking feature table
-exists yet: `07_build_features.R` is next.
+`R/geometry.R`, `R/arrival.R`, `R/pbp.R`, `R/evaluate.R`, and scripts 01–07
+exist. `arrival.parquet`, `throw_frame.parquet`, and `features.parquet` are
+built. Stages 1–3 are fit and scored on the final population (§9). Stage 4
+features (leverage, time to arrival, the passing window) are next.
 
 ### Deferred to future work
 
@@ -1014,12 +1021,12 @@ are rejected in the model frame.
 
 ---
 
-## 9. Baseline models and evaluation
+## 9. Models and evaluation
 
 Implemented in `R/evaluate.R`, reported in `analysis/03_model_baseline.qmd`.
-**Provisional population:** the model frame is assembled in the notebook, with
-the targeted-receiver filter (§4.9) applied inline. The beyond-the-LOS filter
-is not yet applied, so every number in this section will change when it is.
+The model frame is assembled in the notebook, with the question's population
+filters applied inline until `08` exists. Numbers are on that final population
+unless marked otherwise; results on earlier populations are summarized in §9.9.
 
 ### 9.1 Response and scoring population
 
@@ -1027,24 +1034,29 @@ is not yet applied, so every number in this section will change when it is.
 benchmark comparable.
 
 The model frame joins `analytic_sample.parquet`, `number_of_pass_rushers` from
-`plays.parquet`, `pbp.parquet`, and `receiver_player_name` from the nflverse
-mirror, restricted to `pass_result` in {C, I, IN}:
+`plays.parquet`, `pbp.parquet`, `receiver_player_name` from the nflverse mirror,
+`arrival.parquet`, and `features.parquet`, restricted to `pass_result` in
+{C, I, IN}:
 
 | Step | Dropped | Remaining | Complete (kept) | Complete (dropped) |
 |---|---|---|---|---|
 | thrown passes | — | 17,077 | 65.3% | — |
-| nflverse receiver named (population) | 409 | 16,668 | 66.9% | 0.2% |
+| nflverse receiver named (population, §4.9) | 409 | 16,668 | 66.9% | 0.2% |
 | targeted receiver tracked (quality) | 25 | 16,643 | 66.9% | 84.0% |
+| arrival measured (quality, §6.9) | 3 | 16,640 | 66.9% | 0.0% |
+| ball arrives beyond the line, $\text{depth}_{\text{arr}} > 0$ (population, §7) | 3,493 | 13,147 | 63.8% | 78.4% |
+| complete cases across all specs | 2 | **13,145** | 63.8% | 50.0% |
 
-No play in the population lacks a variable any spec requires. Scoring
-population: **16,643 throws, base rate 0.668509**, every one carrying `cp`.
-(Before §4.9, 3 of 17,077 throws lacked `air_yards`; none passes the filter.)
+The two complete-case drops have `closing_throw` undefined because the
+direction of the receiver or nearest defender is missing at the throw. The
+requirement is the union across all specs, so they leave every stage.
+Scoring population: **13,145 throws, base rate 0.6379**, every one carrying
+`cp`.
 
 **Assert, don't filter.** `assert_complete()` fails on any NA in any spec
 variable rather than dropping rows, and every fit uses `na.action = na.fail`:
 `glm()` and `gam()` would otherwise drop rows per stage and score stages on
-different populations. The population requirement is the union across all
-specs.
+different populations.
 
 ### 9.2 Derived predictors
 
@@ -1053,14 +1065,12 @@ specs.
   written when `offense_formation` was in the model (WILDCAT: 31 plays, 17 in
   week 14). `NA` stays `NA`.
 - **`number_of_pass_rushers` clamped to [2, 7].** On the 17,077 throws before
-  §4.9 this moved 117 plays (values 0: 16, 1: 72, 8: 28, 9: 1). Zero rushers on
-  a pass play is a charting artifact, and sparse tails would be extrapolated in
-  the folds that hold them out.
-- **`dist_to_sticks = air_yards - yards_to_go`** replaces `yards_to_go`. Additive
-  smooths in `air_yards` and `yards_to_go` cannot represent whether the throw
-  reaches the line to gain; all three together are linearly dependent.
-- **`air_yards_zero`** flags throws at exactly zero air yards (923 in the
-  population), a point mass a penalized smooth cannot capture.
+  the population filters this moved 117 plays (values 0: 16, 1: 72, 8: 28,
+  9: 1). Zero rushers on a pass play is a charting artifact, and sparse tails
+  would be extrapolated in the folds that hold them out.
+- **`dist_to_sticks = depth_arr - yards_to_go`** replaces `yards_to_go`.
+  Additive smooths in depth and `yards_to_go` cannot represent whether the
+  throw reaches the line to gain; all three together are linearly dependent.
 - **`home`**: offense is the home team.
 
 ### 9.3 Stage specifications
@@ -1068,75 +1078,39 @@ specs.
 Stage 1: intercept-only `glm()`.
 
 Stage 2 (`mgcv::gam()`, REML):
-`s(air_yards) + s(dist_to_sticks) + s(los_x) + s(number_of_pass_rushers, k = 5)
-+ s(air_yards, by = qb_hit) + air_yards_zero + down + pass_location + shotgun +
-home`.
+`s(depth_arr) + s(dist_to_sticks) + s(los_x) + s(number_of_pass_rushers, k = 5)
++ s(depth_arr, by = qb_hit) + down + pass_location + shotgun + home`.
+
+Stage 3: stage 2 + `s(sep_throw) + s(closing_throw) + ti(sep_throw, depth_arr)`
+(§9.8). `R/evaluate.R` asserts that every stage 2 term is in stage 3.
 
 **The nesting is the argument.** Stage 2 already knows the situation and the
-throw's depth, so stages 3 and 4 must earn their improvement on coverage
+throw's depth, so later stages must earn their improvement on coverage
 information alone. Every term removed from stage 2 makes the headline delta
 larger and less defensible, so **baseline terms are cut by argument, never by
 in-sample $p$-value.**
 
+**Depth is the tracking-derived $\text{depth}_{\text{arr}}$** (§6.9), which
+replaced charted `air_yards` once `06` existed. The `air_yards == 0` indicator
+went with it: it captured the charting convention of recording throws at the
+line as exactly zero, and the tracking depth is continuous. A refit with
+charted `air_yards` is an open robustness check (§7).
+
 Stage 2 follows `cp`'s feature set where BDB supports it. Departures:
 
 - **Three pass locations**, not middle/not-middle. Against left, middle is
-  $+0.182$ (SE 0.047) and right $-0.055$ (SE 0.041, $p = 0.17$). Middle differs
-  from both sides. Left and right differed by about 3.6 SE on the population
-  before §4.9 and are not distinguishable on this one; the three-level coding is
-  kept rather than revised on a $p$-value.
-- **`number_of_pass_rushers` added** ($\chi^2 = 39.9$, edf 1.00): a defensive
+  $+0.258$ (SE 0.050) and right $-0.058$ (SE 0.045, $p = 0.19$). Middle differs
+  from both sides; left and right differed by about 3.6 SE on the population
+  before any filter and are not distinguishable on this one. The three-level
+  coding is kept rather than revised on a $p$-value.
+- **`number_of_pass_rushers` added** ($\chi^2 = 16.8$, edf 1.01): a defensive
   control, so stage 3–4 features cannot be said to recapture rushers versus
   droppers.
-- **`air_yards_zero` included**: $-0.62$ (SE 0.083) against an intercept of
-  $1.09$, about half the odds of completion. When it was added during
-  specification (on the population before §4.9), `s(air_yards)` edf rose from
-  4.37 to 7.67 and deviance explained improved on a smaller model.
+- **The QB-hit effect varies with depth** (below).
 - `roof` and era omitted: era is meaningless in one season, and `roof` is not
   in `PBP_COLS`.
-- **The QB-hit effect varies with depth**: `s(air_yards, by = qb_hit)` in place
-  of a single `qb_hit` coefficient. A smooth with a numeric `by` is not
-  centered, so it carries the level of the hit effect and there is no separate
-  `qb_hit` term. See below.
 
-**Adopted: QB hit × depth.** Diagnosis of the earlier specification (single
-`qb_hit` coefficient), which had a calibration slope of 0.62 [0.41, 0.84] on
-throws of 20+ air yards (§9.6). Out-of-fold term contributions were refit
-within each air-yards bucket; `qb_hit` was the term whose effect departed from
-its full-sample strength, and the departure was monotone in depth:
-
-| Air yards | Plays with a hit | Observed hit effect (logit) | Model's hit effect (logit) |
-|---|---|---|---|
-| ≤ 0 | 219 (6.5%) | −1.57 | −0.87 |
-| 1–9 | 548 (7.1%) | −0.94 | −0.81 |
-| 10–19 | 407 (11.3%) | −0.49 | −0.82 |
-| 20+ | 251 (12.6%) | −0.32 | −0.78 |
-
-On deep throws this underpredicted hit plays (29.9% observed, 22.6% predicted)
-and overpredicted the rest (36.9%, 39.0%), which over-spread the predictions.
-The argument for the interaction is about the measurement, not a $p$-value:
-`qb_hit` records a hit on the play, not its timing, and on deep throws the hit
-more often comes after the release. Other terms were checked in the same
-diagnosis: `s(air_yards)` holds its strength on deep throws (coefficient 0.89
-[0.34, 1.45]), and pass location is calibrated there. A smaller misfit on deep
-throws from inside the opponent's 30 (29.7% observed, 37.8% predicted, 232
-plays) runs in the opposite direction and was not acted on.
-
-Effect of the change, out of fold on the 16,643-throw population: log loss
-improves by 0.0012 nats [0.0003, 0.0021] (game clusters), in every air-yards
-bucket; the deep-bucket slope moves from 0.62 to 0.76 [0.50, 1.02]; deviance
-explained rises from 9.90% to 10.12%. Fitted hit effect on the logit: −1.27 at
-the line of scrimmage, −0.64 at 10 air yards, −0.40 at 20, −0.17 at 30. Beyond
-about 35 yards it turns slightly positive (+0.09 at 40, SE 0.25), which is
-implausible but indistinguishable from zero given how few hit plays reach that
-depth. The interaction moves to the tracking-derived throw distance when that
-replaces `air_yards`.
-
-The change was made after seeing out-of-fold results for stage 2, but before
-any stage 3 or 4 result exists, so it cannot have been tuned against coverage
-geometry.
-
-Tested and dropped (during specification, on the population before §4.9):
+Tested and dropped during specification, on the population before any filter:
 
 - **`offense_formation`**: describes scheme rather than difficulty, and is
   aliased with `shotgun` (an empty-backfield snap is essentially always from
@@ -1146,17 +1120,39 @@ Tested and dropped (during specification, on the population before §4.9):
   implausible tail values, and the blowout mechanism behind score differential
   is absent from the data.
 
-**Retained despite being weak:** `s(dist_to_sticks)`, edf 1.01, $p = 0.08$. It
+**Retained despite being weak:** `s(dist_to_sticks)`, edf 1.73, $p = 0.37$. It
 is the model's only `yards_to_go` information.
 
-Other stage 2 effects: `shotgun` $-0.264$ (SE 0.049) — conditional on depth,
-shotgun passes complete less often; third down $-0.16$ (SE 0.048).
-`s(air_yards)` edf 5.92; the hit-by-depth smooth edf 4.04. Deviance explained
-**10.12%** in-sample.
+**Adopted: QB hit × depth**, as `s(depth, by = qb_hit)` in place of a single
+`qb_hit` coefficient. A smooth with a numeric `by` is not centered, so it carries
+the level of the hit effect and there is no separate `qb_hit` term. Diagnosed
+on the targeted-receiver population with charted air yards, before the
+beyond-the-line filter: out-of-fold term contributions refit within each
+air-yards bucket showed `qb_hit` departing from its full-sample strength,
+monotonically in depth.
 
-`air_yards` is provisional because it is charted, not measured. Once `06`
-exists, the tracking-derived throw distance replaces it and `air_yards` becomes
-a robustness refit.
+| Air yards | Plays with a hit | Observed hit effect (logit) | Model's hit effect (logit) |
+|---|---|---|---|
+| ≤ 0 | 219 (6.5%) | −1.57 | −0.87 |
+| 1–9 | 548 (7.1%) | −0.94 | −0.81 |
+| 10–19 | 407 (11.3%) | −0.49 | −0.82 |
+| 20+ | 251 (12.6%) | −0.32 | −0.78 |
+
+On deep throws the constant effect underpredicted hit plays (29.9% observed,
+22.6% predicted) and overpredicted the rest (36.9%, 39.0%). The argument is
+about the measurement, not a $p$-value: `qb_hit` records a hit on the play, not
+its timing, and on deep throws the hit more often comes after the release.
+`s(air_yards)` and pass location held their strength on deep throws in the same
+diagnosis. When adopted, out-of-fold log loss improved by 0.0012 nats [0.0003,
+0.0021] and the deep-bucket slope moved from 0.62 to 0.76. The change was made
+after seeing stage 2's out-of-fold results but before any stage 3 or 4 result
+existed. On the final population the fitted hit effect is −1.05 at 2 yd, −0.65
+at 10, −0.39 at 20, and −0.16 at 30.
+
+Other stage 2 effects on the final population: `shotgun` $-0.278$ (SE 0.054) —
+conditional on depth, shotgun passes complete less often; third down $-0.17$
+(SE 0.053). `s(depth_arr)` edf 3.55; the hit-by-depth smooth edf 3.32.
+Deviance explained **8.72%** in-sample.
 
 ### 9.4 Resampling and fitting
 
@@ -1185,10 +1181,11 @@ own rate. Both checks are asserted in the notebook.
 
 | | Out-of-fold log loss |
 |---|---|
-| $H(\bar y)$, $\bar y = 0.668509$ | 0.6352 |
-| Stage 1 | 0.6353 (+0.00011) |
-| Stage 2 | 0.5728 |
-| nflverse `cp` | 0.5663 |
+| $H(\bar y)$, $\bar y = 0.6379$ | 0.6546 |
+| Stage 1 | 0.6547 |
+| Stage 2 | 0.5994 |
+| nflverse `cp` | 0.5900 |
+| **Stage 3** | **0.5550** |
 
 **Paired $\Delta$ log loss** (`paired_delta()`): the mean of per-play
 differences, with a cluster bootstrap percentile interval (10,000 draws) that
@@ -1200,14 +1197,12 @@ check.
 
 | Stage 2 − stage 1 | $\Delta$ | 95% interval | SE (bootstrap) | SE (analytic) | SE (iid) | Design effect |
 |---|---|---|---|---|---|---|
-| game | −0.0626 | [−0.0678, −0.0573] | 0.00269 | 0.00269 | 0.00268 | 1.01 |
-| week | −0.0626 | [−0.0674, −0.0578] | 0.00244 | 0.00252 | 0.00268 | 0.88 |
+| game | −0.0553 | [−0.0613, −0.0495] | 0.00300 | 0.00299 | 0.00285 | 1.10 |
+| week | −0.0553 | [−0.0611, −0.0495] | 0.00294 | 0.00305 | 0.00285 | 1.14 |
 
-Clustering is immaterial for this comparison: game-level factors affect both
-stages' losses alike and cancel in the paired difference. The week design
-effect is within the noise of a 17-cluster estimate. Game clustering is kept
-because stage 3–4 gains may concentrate by game. (On the population before
-§4.9, 17,074 throws: $-0.0621$ [$-0.0673$, $-0.0570$].)
+Clustering matters little for this comparison: game-level factors affect both
+stages' losses alike and largely cancel in the paired difference. Game
+clustering is kept because coverage-feature gains may concentrate by game.
 
 Rejected: unpaired comparison of two intervals (ignores the shared play-level
 difficulty); a play-level bootstrap (ignores within-game dependence); refitting
@@ -1227,50 +1222,126 @@ binning.
 
 **Display:** a smoothed calibration curve (binomial GAM of the outcome on
 $\operatorname{logit}\hat p$, pointwise 95% band) with 20 equal-count bins.
-Figures: `figs/week06/calibration.png`, `calibration_by_air_yards.png`.
+Figures: `figs/week06/calibration.png`, `calibration_by_depth.png`.
 
-**Subgroups:** air-yards buckets with edges fixed in advance — $\le 0$, 1–9,
-10–19, 20+ (`air_yards_bucket()`). Separation buckets follow with stage 3.
+**Subgroups:** depth buckets on $\text{depth}_{\text{arr}}$ with edges fixed in
+advance — 0–10, 10–20, 20+ yd (`depth_bucket()`). Separation buckets are a
+possible addition.
 
 | | CITL | Slope |
 |---|---|---|
-| Stage 2 | 0.000 [−0.008, 0.008] | 0.989 [0.944, 1.037] |
-| `cp` | 0.005 [−0.003, 0.013] | 1.022 [0.979, 1.067] |
+| Stage 2 | 0.000 [−0.009, 0.009] | 0.987 [0.933, 1.045] |
+| `cp` | 0.012 [0.003, 0.020] | 1.061 [1.009, 1.115] |
+| Stage 3 | 0.000 [−0.009, 0.009] | 0.988 [0.941, 1.032] |
 
-| Air yards (n) | Stage 2 slope | `cp` slope |
-|---|---|---|
-| Air yards (n) | Stage 2 slope | Before QB hit × depth | `cp` slope |
+| Depth (n) | Stage 2 slope | Stage 3 slope | `cp` slope |
 |---|---|---|---|
-| $\le 0$ (3,371) | 0.86 [0.71, 0.99] | 0.96 [0.79, 1.13] | 0.97 [0.85, 1.10] |
-| 1–9 (7,679) | 0.95 [0.84, 1.05] | 0.98 [0.87, 1.08] | 1.01 [0.91, 1.11] |
-| 10–19 (3,601) | 1.11 [0.94, 1.28] | 0.97 [0.81, 1.12] | 1.01 [0.88, 1.15] |
-| 20+ (1,992) | **0.76 [0.50, 1.02]** | 0.62 [0.41, 0.84] | 1.05 [0.79, 1.32] |
+| 0–10 (7,970) | 0.94 [0.83, 1.05] | 0.98 [0.91, 1.05] | 1.07 [0.97, 1.18] |
+| 10–20 (3,498) | 1.16 [1.005, 1.33] | 1.02 [0.92, 1.12] | 1.18 [1.05, 1.33] |
+| 20+ (1,677) | 0.84 [0.54, 1.18] | 0.90 [0.73, 1.07] | 1.46 [1.14, 1.80] |
 
-CITL intervals contain zero in every bucket for both. **Deep throws remain stage
-2's weakest bucket.** Before the QB hit × depth interaction its slope there was
-0.62 and the interval excluded 1; the interaction (§9.3) brings it to 0.76,
-with an interval that just includes 1. The behind-the-line bucket's slope fell
-to 0.86 [0.71, 0.99]; that bucket leaves the population with the
-beyond-the-line filter. Stage 3–4 results are reported by depth as well as
-overall.
+Stage 2's CITL contains zero in every bucket; `cp` underpredicts on short
+throws (0.014 [0.004, 0.023]). Stage 2 is slightly too timid at intermediate
+depth. **`cp` is slightly miscalibrated beyond the line of scrimmage**:
+it underpredicts and is too timid, most of all on deep throws. It was fit to all
+passes, including the screens removed here, so some miscalibration on a
+subpopulation is expected. Stage 3 is calibrated overall and within sampling
+error of 1 in every depth bucket, once separation interacts with depth (§9.8).
 
 ### 9.7 The `cp` benchmark
 
-`cp` is scored as a fixed external set of predictions on the same 16,643 rows;
+`cp` is scored as a fixed external set of predictions on the same 13,145 rows;
 it is not refit or recalibrated.
 
 | Comparison (game clusters) | $\Delta$ | 95% interval |
 |---|---|---|
-| Stage 2 − `cp` | +0.0065 | [+0.0048, +0.0083] |
-| `cp` − stage 1 | −0.0691 | [−0.0743, −0.0638] |
+| Stage 2 − `cp` | +0.0094 | [+0.0072, +0.0116] |
+| `cp` − stage 1 | −0.0647 | [−0.0706, −0.0590] |
+| Stage 3 − `cp` | **−0.0350** | [−0.0404, −0.0294] |
 
-`cp` beats stage 2 by 0.0065 nats (0.0077 before the QB hit × depth
-interaction); stage 2 captures 91% of `cp`'s improvement over the base rate. Both are calibrated overall, so the gap is in
-discrimination. Plausible sources, not separable here: `cp`'s model class
-represents interactions (consistent with the deep-throw findings in §9.3 and
-§9.6), it is
-trained on far more plays, and 2018 is partly in its training data. The gap is
-the reference point for stages 3 and 4.
+`cp` beats stage 2 by 0.0094 nats, so stage 2 captures 85% of `cp`'s
+improvement over the base rate. `cp` leads despite its miscalibration, so the
+gap is in discrimination. Plausible sources, not separable here: `cp`'s model
+class represents interactions, it is trained on far more plays, and 2018 is
+partly in its training data. Stage 3 overtakes it (§9.8).
+
+### 9.8 Stage 3: separation at the throw
+
+**Features** (`scripts/07_build_features.R`, `features.parquet`), at the throw
+frame. With $\mathbf{x}_r$ the targeted receiver and $D$ the tracked defenders,
+the nearest defender is
+$j^* = \arg\min_{j \in D} \lVert \mathbf{x}_j - \mathbf{x}_r \rVert$ and
+
+$$
+\texttt{sep\_throw} = \lVert \mathbf{x}_{j^*} - \mathbf{x}_r \rVert, \qquad
+\texttt{closing\_throw} =
+\frac{(\mathbf{v}_{j^*} - \mathbf{v}_r) \cdot (\mathbf{x}_{j^*} - \mathbf{x}_r)}{\texttt{sep\_throw}}
+$$
+
+with velocities from speed and direction; closing speed is negative when the
+defender is gaining.
+
+- **At the throw**, because the question is the completion probability at
+  release; separation at arrival is partly the catch.
+- **Nearest defender**, not assigned: assignment needs coverage labels (§3).
+- **Analytic closing speed**, defined at a single frame, rather than
+  differenced positions.
+- **Smooths** in both. Ties for the nearest defender go to the lower `nfl_id`;
+  there are none. Missing `dir` propagates to NA rather than being imputed
+  (5 plays of 16,646; 2 in the population).
+- **Separation × depth**, `ti(sep_throw, depth_arr)`, alongside the main
+  effects. On a deep throw the ball is in the air long enough for separation at
+  the release to change before it arrives, so separation should matter less.
+  Without the interaction, stage 3 applied separation's full-sample effect to
+  deep throws and was too extreme there: calibration slope 0.73 [0.59, 0.86] on
+  20+ yd. With it, the slope is 0.90 [0.73, 1.07], deep-throw log loss improves
+  from 0.6271 to 0.6216, and overall log loss by 0.0009 nats [−0.0000, 0.0019].
+  Chosen over waiting for stage 4, so that stage 3 is a calibrated baseline for
+  stage 4. As with QB hit × depth, the change was made after seeing stage 3's
+  out-of-fold results but before any stage 4 result exists.
+
+Completion by separation at the throw: 29.9% at 0–1 yd, 47.9% at 1–2, 62.7% at
+2–3, 72.9% at 3–5, 80.4% at 5–8, 84.4% beyond 8 yd.
+
+**Results** (13,145 throws, out of fold):
+
+| | $\Delta$ | 95% interval |
+|---|---|---|
+| Stage 3 − stage 2 (game) | **−0.0444** | [−0.0495, −0.0391] |
+| Stage 3 − stage 2 (week) | −0.0444 | [−0.0478, −0.0404] |
+| Stage 3 − `cp` (game) | −0.0350 | [−0.0404, −0.0294] |
+
+Separation adds 0.0444 nats, about 80% of stage 2's whole gain over the base
+rate (0.0553), and moves the model from 0.0094 nats behind `cp` to 0.0350 ahead.
+In-sample deviance explained rises from 8.72% to 15.73%; `s(sep_throw)` edf
+7.57, `s(closing_throw)` edf 6.38, `ti(sep_throw, depth_arr)` edf 2.92.
+Stage 3 is calibrated overall and in every depth bucket (§9.6), so the
+improvement is not overfit.
+
+**By depth** (game clusters):
+
+| Depth (n) | Stage 2 log loss | Stage 3 − stage 2 | Share of stage 2 loss |
+|---|---|---|---|
+| 0–10 (7,970) | 0.5615 | −0.0476 [−0.0547, −0.0405] | 8.5% |
+| 10–20 (3,498) | 0.6624 | −0.0455 [−0.0557, −0.0352] | 6.9% |
+| 20+ (1,677) | 0.6481 | −0.0264 [−0.0374, −0.0151] | 4.1% |
+
+Separation still helps least on deep throws, where separation at the release
+says least about separation at the catch. That is what stage 4's time-based
+features are designed to address.
+
+These numbers are provisional until `08` builds the model frame.
+
+### 9.9 Results on earlier populations
+
+For the record; superseded by the sections above.
+
+| Population | Throws | Stage 2 − stage 1 | Stage 2 − `cp` |
+|---|---|---|---|
+| All throws, charted air yards | 17,074 | −0.0621 [−0.0673, −0.0570] | — |
+| Targeted receiver, charted air yards, constant QB hit | 16,643 | −0.0613 [−0.0666, −0.0561] | +0.0077 [+0.0058, +0.0096] |
+| Targeted receiver, charted air yards, QB hit × depth | 16,643 | −0.0626 [−0.0678, −0.0573] | +0.0065 [+0.0048, +0.0083] |
+| **Final:** + beyond the line, tracking depth | 13,145 | −0.0553 [−0.0613, −0.0495] | +0.0094 [+0.0072, +0.0116] |
 
 ## 10. Known technical constraints
 

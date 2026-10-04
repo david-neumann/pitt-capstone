@@ -23,7 +23,7 @@
 #   calibration_stats()     calibration-in-the-large, intercept, slope
 #   calibration_summary()   the same with a cluster bootstrap interval
 #   calibration_curve()     binned and smoothed reliability curves
-#   air_yards_bucket()      subgroup buckets for calibration
+#   depth_bucket()          subgroup buckets by depth
 #
 # mgcv must be attached (library(mgcv)) before fitting, because the spec
 # formulas use bare s().
@@ -38,14 +38,12 @@
 #'   NA, so assert_complete() still sees it.
 #' - `number_of_pass_rushers` is clamped to `rush_range`; the tails hold
 #'   a handful of plays and would otherwise be extrapolated in some folds.
-#' - `dist_to_sticks = air_yards - yards_to_go` replaces `yards_to_go`,
+#' - `dist_to_sticks = depth_arr - yards_to_go` replaces `yards_to_go`,
 #'   since all three together are linearly dependent.
-#' - `air_yards_zero` flags throws at exactly zero air yards, a point
-#'   mass a penalized smooth cannot capture.
 #' - `home` is 1 when the offense is the home team.
 #'
 #' @param df Throws with `pass_result` in C, I, IN and the predictor
-#'   columns.
+#'   columns, including `depth_arr` from arrival.parquet.
 #' @param min_level_n Minimum plays per factor level.
 #' @param rush_range Clamp range for `number_of_pass_rushers`.
 #' @return `df` with the response and derived columns added.
@@ -84,8 +82,7 @@ prepare_model_frame <- function(
         rush_range[1],
         rush_range[2]
       ),
-      dist_to_sticks = air_yards - yards_to_go,
-      air_yards_zero = as.integer(air_yards == 0),
+      dist_to_sticks = depth_arr - yards_to_go,
       home = as.integer(posteam_type == "home")
     )
 }
@@ -104,6 +101,11 @@ prepare_model_frame <- function(
 #' Stage 2 follows the nflverse `cp` feature set where the data allow,
 #' with these differences:
 #'
+#' - Depth is `depth_arr`, the tracking-derived distance from the line of
+#'   scrimmage to the arrival point (scripts/06_build_throw_frame.R),
+#'   rather than charted `air_yards`. The `air_yards == 0` indicator is
+#'   dropped with it: it captured a charting convention, and the tracking
+#'   depth is continuous.
 #' - `pass_location` keeps three levels rather than middle/not-middle.
 #' - `number_of_pass_rushers` is added as a defensive control.
 #' - `roof` and era are omitted.
@@ -112,17 +114,17 @@ prepare_model_frame <- function(
 #' - `defenders_in_the_box` and `score_differential` are excluded.
 #' - `s(dist_to_sticks)` is kept although it fits as nearly linear; it is
 #'   the model's only `yards_to_go` information.
-#' - `qb_hit` enters as `s(air_yards, by = qb_hit)`, because its effect
+#' - `qb_hit` enters as `s(depth_arr, by = qb_hit)`, because its effect
 #'   weakens with depth (notes/decisions.md §9.3). A smooth with a numeric
 #'   `by` is not centered, so it carries the level of the hit effect and
 #'   there is no separate `qb_hit` term.
 #'
-#' `air_yards` is charted rather than measured and will be replaced by
-#' the tracking-derived throw distance once that exists. Fitted effects
-#' are reported in analysis/03_model_baseline.qmd §3.
-#'
-#' Stages 3 (separation) and 4 (full geometry) are added once their
-#' feature columns exist.
+#' Stage 3 adds separation from the nearest defender and its rate of
+#' change, both at the throw frame (scripts/07_build_features.R), and a
+#' separation-by-depth interaction, because separation at the throw matters
+#' less on deep throws (notes/decisions.md §9.8). Stage 4
+#' (full geometry) is added once its feature columns exist. Fitted effects
+#' are reported in analysis/03_model_baseline.qmd.
 MODEL_SPECS <- list(
   `1. intercept` = list(
     engine = "glm",
@@ -133,18 +135,41 @@ MODEL_SPECS <- list(
   `2. play-by-play` = list(
     engine = "gam",
     formula = complete ~
-      s(air_yards) +
+      s(depth_arr) +
       s(dist_to_sticks) +
       s(los_x) +
       s(number_of_pass_rushers, k = 5) +
-      s(air_yards, by = qb_hit) +
-      air_yards_zero +
+      s(depth_arr, by = qb_hit) +
       down +
       pass_location +
       shotgun +
       home
+  ),
+
+  `3. + separation` = list(
+    engine = "gam",
+    formula = complete ~
+      s(depth_arr) +
+      s(dist_to_sticks) +
+      s(los_x) +
+      s(number_of_pass_rushers, k = 5) +
+      s(depth_arr, by = qb_hit) +
+      down +
+      pass_location +
+      shotgun +
+      home +
+      s(sep_throw) +
+      s(closing_throw) +
+      ti(sep_throw, depth_arr)
   )
 )
+
+# Stage 3 must be stage 2 plus separation terms, so the comparison is
+# nested.
+stopifnot(all(
+  attr(stats::terms(MODEL_SPECS[["2. play-by-play"]]$formula), "term.labels") %in%
+    attr(stats::terms(MODEL_SPECS[["3. + separation"]]$formula), "term.labels")
+))
 
 
 # ---- the scoring population --------------------------------------
@@ -701,18 +726,19 @@ calibration_curve <- function(y, p, n_bins = 20, n_grid = 200, level = 0.95) {
 }
 
 
-#' Air-yards buckets for subgroup calibration
+#' Depth buckets for subgroup reporting
 #'
-#' Fixed football-meaningful edges: at or behind the line, short,
-#' intermediate, deep.
+#' Fixed football-meaningful edges on a continuous depth: at or behind the
+#' line, short, intermediate, deep. With the beyond-the-line filter
+#' applied, the first bucket is empty.
 #'
-#' @param air_yards Numeric vector.
-#' @return Factor with levels "<= 0", "1-9", "10-19", "20+".
-air_yards_bucket <- function(air_yards) {
+#' @param depth Numeric vector, yards beyond the line of scrimmage.
+#' @return Factor with levels "<= 0", "0-10", "10-20", "20+".
+depth_bucket <- function(depth) {
   cut(
-    air_yards,
-    breaks = c(-Inf, 0, 9, 19, Inf),
-    labels = c("<= 0", "1-9", "10-19", "20+"),
+    depth,
+    breaks = c(-Inf, 0, 10, 20, Inf),
+    labels = c("<= 0", "0-10", "10-20", "20+"),
     right = TRUE
   )
 }
