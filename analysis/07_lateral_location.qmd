@@ -69,6 +69,12 @@ Expectations, recorded before fitting (§9.13):
 It reads `model_frame.parquet` and the predictions persisted by
 `scripts/09_fit_models.R`, and writes nothing to `data/`.
 
+Candidate F (§5) was adopted. "Current" stage 2 and 4 in this notebook are
+therefore the specs as they were before, labelled `2 (charted)` and
+`4 (charted)`: rebuilt from `MODEL_SPECS` by putting charted `pass_location`
+back in place of the adopted terms, and refit here. Candidate F is checked to
+reproduce the persisted stage 2 and 4 predictions.
+
 ```{r}
 #| label: load_data
 
@@ -100,8 +106,11 @@ swap_terms <- function(spec, drop = character(0), add = character(0)) {
   spec
 }
 
-s2 <- MODEL_SPECS[["2. play-by-play"]]
-s4 <- MODEL_SPECS[["4. + geometry"]]
+# The specs before §9.13's revision: charted three-level pass_location in
+# place of the adopted pass_middle and s(sideline_rec).
+adopted <- c("pass_middle", "s(sideline_rec)")
+s2 <- swap_terms(MODEL_SPECS[["2. play-by-play"]], adopted, "pass_location")
+s4 <- swap_terms(MODEL_SPECS[["4. + geometry"]], adopted, "pass_location")
 
 lat <- "s(lat_arr)"
 side <- c(lat, "s(sideline_arr)")
@@ -136,14 +145,11 @@ tibble(
 # Folds from mf itself, which carries sideline_in.
 folds <- make_folds(mf)
 
-preds <- bind_rows(
-  filter(oof, model %in% c("2. play-by-play", "4. + geometry")),
-  imap(
-    candidates,
-    \(spec, name) cv_predict(mf, folds, spec, name, verbose = FALSE)
-  ) |>
-    list_rbind()
-)
+preds <- imap(
+  c(list(`2 (charted)` = s2, `4 (charted)` = s4), candidates),
+  \(spec, name) cv_predict(mf, folds, spec, name, verbose = FALSE)
+) |>
+  list_rbind()
 ```
 
 ```{r}
@@ -167,16 +173,16 @@ Paired differences, model minus reference (negative favours the model):
 
 comparisons <- tribble(
   ~question, ~reference, ~model,
-  "A: lateral offset for pass_location", "2. play-by-play", "2A",
-  "B: + sideline distance", "2. play-by-play", "2B",
-  "C: + sideline distance, clamped at 0", "2. play-by-play", "2C",
+  "A: lateral offset for pass_location", "2 (charted)", "2A",
+  "B: + sideline distance", "2 (charted)", "2B",
+  "C: + sideline distance, clamped at 0", "2 (charted)", "2C",
   "B vs C: out-of-bounds distance", "2C", "2B",
   "sideline beyond lateral offset", "2A", "2B",
-  "stage 4 with B vs stage 4", "4. + geometry", "4B",
-  "tracking gain, current", "2. play-by-play", "4. + geometry",
+  "stage 4 with B vs stage 4", "4 (charted)", "4B",
+  "tracking gain, current", "2 (charted)", "4 (charted)",
   "tracking gain on B", "2B", "4B",
   "tracking gain on C", "2C", "4C",
-  "window margin, current stage 4", "4. + geometry", "4 without window",
+  "window margin, current stage 4", "4 (charted)", "4 without window",
   "window margin, stage 4 on B", "4B", "4B without window"
 )
 
@@ -206,7 +212,7 @@ bootstrap intervals are in notebook 03 for the adopted stages.
 ```{r}
 #| label: calibration
 
-stage2_models <- c("2. play-by-play", "2A", "2B", "2C")
+stage2_models <- c("2 (charted)", "2A", "2B", "2C")
 
 by_depth <- preds |>
   filter(model %in% stage2_models) |>
@@ -337,6 +343,21 @@ preds_2 <- bind_rows(
   ) |>
     list_rbind()
 )
+
+# Candidate F is the adopted spec, so it must reproduce the persisted
+# predictions; the term order differs, hence the tolerance.
+stopifnot(
+  isTRUE(all.equal(
+    preds_2$.pred[preds_2$model == "2F"],
+    oof$.pred[oof$model == "2. play-by-play"],
+    tolerance = 1e-6
+  )),
+  isTRUE(all.equal(
+    preds_2$.pred[preds_2$model == "4F"],
+    oof$.pred[oof$model == "4. + geometry"],
+    tolerance = 1e-6
+  ))
+)
 ```
 
 ```{r}
@@ -344,12 +365,12 @@ preds_2 <- bind_rows(
 
 comparisons_2 <- tribble(
   ~question, ~reference, ~model,
-  "E: pass_middle for pass_location", "2. play-by-play", "2E",
-  "F: + receiver sideline distance", "2. play-by-play", "2F",
-  "G: + receiver sideline distance, clamped at 0", "2. play-by-play", "2G",
+  "E: pass_middle for pass_location", "2 (charted)", "2E",
+  "F: + receiver sideline distance", "2 (charted)", "2F",
+  "G: + receiver sideline distance, clamped at 0", "2 (charted)", "2G",
   "F vs G: receiver out of bounds", "2G", "2F",
   "F vs C: receiver vs ball (clamped)", "2C", "2F",
-  "stage 4 with F vs stage 4", "4. + geometry", "4F",
+  "stage 4 with F vs stage 4", "4 (charted)", "4F",
   "tracking gain on F", "2F", "4F"
 )
 
@@ -373,7 +394,7 @@ comparisons_2 |>
 #| label: calibration-2
 
 by_depth_2 <- preds_2 |>
-  filter(model %in% c("2. play-by-play", "2C", "2E", "2F", "2G")) |>
+  filter(model %in% c("2 (charted)", "2C", "2E", "2F", "2G")) |>
   left_join(
     select(mf, game_id, play_id, depth_arr),
     by = c("game_id", "play_id")

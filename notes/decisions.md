@@ -1081,7 +1081,8 @@ Stage 1: intercept-only `glm()`.
 
 Stage 2 (`mgcv::gam()`, REML):
 `s(depth_arr) + s(dist_to_sticks) + s(los_x) + s(number_of_pass_rushers, k = 5)
-+ s(depth_arr, by = qb_hit) + down + pass_location + shotgun + home`.
++ s(depth_arr, by = qb_hit) + down + pass_middle + s(sideline_rec) + shotgun
++ home` (location revised in §9.13).
 
 Stage 3: stage 2 + `s(sep_throw) + s(closing_throw) + ti(sep_throw, depth_arr)`
 (§9.8).
@@ -1105,11 +1106,17 @@ charted `air_yards` is a robustness check (§9.11).
 
 Stage 2 follows `cp`'s feature set where BDB supports it. Departures:
 
-- **Three pass locations**, not middle/not-middle. Against left, middle is
+- **Location: middle or not, plus the receiver's sideline distance** (§9.13).
+  `pass_middle` matches `cp`'s coding; `s(sideline_rec)`, the targeted
+  receiver's distance to the nearer sideline at the arrival frame, is
+  information `cp` does not have. Superseded first coding, kept for the
+  record: **three pass locations**, not middle/not-middle. Against left, middle is
   $+0.257$ (SE 0.050) and right $-0.060$ (SE 0.045, $p = 0.18$). Middle differs
   from both sides; left and right differed by about 3.6 SE on the population
   before any filter and are not distinguishable on this one. The three-level
-  coding is kept rather than revised on a $p$-value.
+  coding was kept rather than revised on a $p$-value, and later replaced on an
+  argument (no football reason for left and right to differ) once the
+  sideline was found to carry the location effect (§9.13).
 - **`number_of_pass_rushers` added** ($\chi^2 = 16.8$, edf 1.01): a defensive
   control, so stage 3–4 features cannot be said to recapture rushers versus
   droppers.
@@ -1177,16 +1184,17 @@ Deviance explained **8.74%** in-sample.
   predictions (`data/processed/oof_preds.parquet`, one row per play and stage:
   4 × 13,125 = 52,500 rows), a manifest (`oof_specs.parquet`: each spec as
   text, a hash of the model inputs, R and mgcv versions), and the fits on all
-  rows (`models/full_fits.rds`, 7.8 MB). Every metric in §9.5–9.11 is a
+  rows (`models/full_fits.rds`, about 8 MB). Every metric in §9.5–9.11 is a
   function of the outcome, the out-of-fold predictions, and model-frame
   columns, so the 68 fold fits are not kept. The notebooks read through
   `read_oof_preds()` and `read_full_fits()`, which stop if any spec's
   engine, formula, or knots differs from the manifest, a stage was added or
   removed, or the hash of the model-frame columns the specs use has changed;
   a change to any other column does not trigger a refit. `cp` is appended
-  from the model frame on read rather than stored twice. 09 reproduces the
-  notebook's out-of-fold log losses exactly (0.6548, 0.5994, 0.5550, 0.5431)
-  and takes about 3 minutes.
+  from the model frame on read rather than stored twice. When introduced, 09
+  reproduced the notebook's out-of-fold log losses exactly (0.6548, 0.5994,
+  0.5550, 0.5431, on the specification of the time); it takes about 3
+  minutes.
 - **Rejected:** Quarto `freeze`/`cache` (freeze is skipped when one file is
   rendered, and neither tracks `R/` or `data/`), keeping the fold fits (no
   metric needs them), and a wide table (the scoring functions take one row
@@ -1208,10 +1216,10 @@ own rate. Both checks are asserted in the notebook.
 |---|---|
 | $H(\bar y)$, $\bar y = 0.6377$ | 0.6547 |
 | Stage 1 | 0.6548 |
-| Stage 2 | 0.5994 |
+| Stage 2 | 0.5946 |
 | nflverse `cp` | 0.5900 |
-| Stage 3 | 0.5550 |
-| **Stage 4** | **0.5431** |
+| Stage 3 | 0.5504 |
+| **Stage 4** | **0.5388** |
 
 **Paired $\Delta$ log loss** (`paired_delta()`): the mean of per-play
 differences, with a cluster bootstrap percentile interval (10,000 draws) that
@@ -1223,8 +1231,8 @@ check.
 
 | Stage 2 − stage 1 | $\Delta$ | 95% interval | SE (bootstrap) | SE (analytic) | SE (iid) | Design effect |
 |---|---|---|---|---|---|---|
-| game | −0.0554 | [−0.0614, −0.0496] | 0.00301 | 0.00300 | 0.00285 | 1.10 |
-| week | −0.0554 | [−0.0612, −0.0496] | 0.00296 | 0.00308 | 0.00285 | 1.16 |
+| game | −0.0602 | [−0.0664, −0.0542] | 0.00314 | 0.00313 | 0.00294 | 1.13 |
+| week | −0.0602 | [−0.0658, −0.0544] | 0.00292 | 0.00303 | 0.00294 | 1.06 |
 
 Clustering matters little for this comparison: game-level factors affect both
 stages' losses alike and largely cancel in the paired difference. Game
@@ -1258,18 +1266,20 @@ possible addition.
 |---|---|---|
 | Stage 2 | 0.000 [−0.009, 0.009] | 0.987 [0.933, 1.045] |
 | `cp` | 0.012 [0.003, 0.020] | 1.061 [1.008, 1.116] |
-| Stage 3 | 0.000 [−0.009, 0.009] | 0.987 [0.940, 1.033] |
-| Stage 4 | 0.000 [−0.008, 0.009] | 0.988 [0.945, 1.033] |
+| Stage 3 | 0.000 [−0.009, 0.009] | 0.988 [0.942, 1.031] |
+| Stage 4 | 0.000 [−0.008, 0.009] | 0.988 [0.945, 1.031] |
 
 | Depth (n) | Stage 2 slope | Stage 3 slope | Stage 4 slope | `cp` slope |
 |---|---|---|---|---|
-| 0–10 (7,953) | 0.94 [0.83, 1.05] | 0.98 [0.91, 1.05] | 1.00 [0.94, 1.07] | 1.07 [0.96, 1.18] |
-| 10–20 (3,495) | 1.16 [1.007, 1.34] | 1.02 [0.92, 1.12] | 0.99 [0.90, 1.08] | 1.19 [1.05, 1.33] |
-| 20+ (1,677) | 0.84 [0.54, 1.18] | 0.90 [0.74, 1.07] | 0.86 [0.73, 0.996] | 1.46 [1.14, 1.80] |
+| 0–10 (7,953) | 0.96 [0.86, 1.06] | 0.98 [0.92, 1.05] | 1.01 [0.94, 1.07] | 1.07 [0.96, 1.18] |
+| 10–20 (3,495) | 1.06 [0.92, 1.20] | 1.00 [0.91, 1.09] | 0.99 [0.90, 1.07] | 1.19 [1.05, 1.33] |
+| 20+ (1,677) | 0.91 [0.70, 1.13] | 0.92 [0.77, 1.08] | 0.86 [0.74, 0.985] | 1.46 [1.14, 1.80] |
 
 Stage 2's CITL contains zero in every bucket; `cp` underpredicts on short
-throws (0.014 [0.004, 0.023]). Stage 2 is slightly too timid at intermediate
-depth. **`cp` is slightly miscalibrated beyond the line of scrimmage**:
+throws (0.014 [0.004, 0.023]). Stage 2's slope is within sampling error of 1
+in every bucket; with charted three-level location it was slightly too timid
+at intermediate depth (1.16 [1.007, 1.34]), which the sideline term removed
+(§9.13). **`cp` is slightly miscalibrated beyond the line of scrimmage**:
 it underpredicts and is too timid, most of all on deep throws. It was fit to all
 passes, including the screens removed here, so some miscalibration on a
 subpopulation is expected. Stage 3 is calibrated overall and within sampling
@@ -1283,12 +1293,12 @@ it is not refit or recalibrated.
 
 | Comparison (game clusters) | $\Delta$ | 95% interval |
 |---|---|---|
-| Stage 2 − `cp` | +0.0093 | [+0.0071, +0.0115] |
+| Stage 2 − `cp` | +0.0045 | [+0.0019, +0.0072] |
 | `cp` − stage 1 | −0.0647 | [−0.0707, −0.0591] |
-| Stage 3 − `cp` | −0.0350 | [−0.0405, −0.0295] |
-| Stage 4 − `cp` | **−0.0470** | [−0.0530, −0.0409] |
+| Stage 3 − `cp` | −0.0397 | [−0.0453, −0.0340] |
+| Stage 4 − `cp` | **−0.0513** | [−0.0573, −0.0451] |
 
-`cp` beats stage 2 by 0.0093 nats, so stage 2 captures 86% of `cp`'s
+`cp` beats stage 2 by 0.0045 nats, so stage 2 captures 93% of `cp`'s
 improvement over the base rate. `cp` leads despite its miscalibration, so the
 gap is in discrimination. Plausible sources, not separable here: `cp`'s model
 class represents interactions, it is trained on far more plays, and 2018 is
@@ -1336,14 +1346,14 @@ Completion by separation at the throw: 29.9% at 0–1 yd, 47.9% at 1–2, 62.7% 
 
 | | $\Delta$ | 95% interval |
 |---|---|---|
-| Stage 3 − stage 2 (game) | **−0.0444** | [−0.0495, −0.0392] |
-| Stage 3 − stage 2 (week) | −0.0444 | [−0.0478, −0.0404] |
-| Stage 3 − `cp` (game) | −0.0350 | [−0.0405, −0.0295] |
+| Stage 3 − stage 2 (game) | **−0.0442** | [−0.0492, −0.0391] |
+| Stage 3 − stage 2 (week) | −0.0442 | [−0.0478, −0.0400] |
+| Stage 3 − `cp` (game) | −0.0397 | [−0.0453, −0.0340] |
 
-Separation adds 0.0444 nats, about 80% of stage 2's whole gain over the base
-rate (0.0554), and moves the model from 0.0093 nats behind `cp` to 0.0350 ahead.
-In-sample deviance explained rises from 8.74% to 15.75%; `s(sep_throw)` edf
-7.55, `s(closing_throw)` edf 6.40, `ti(sep_throw, depth_arr)` edf 2.92.
+Separation adds 0.0442 nats, about 73% of stage 2's whole gain over the base
+rate (0.0602), and moves the model from 0.0045 nats behind `cp` to 0.0397 ahead.
+In-sample deviance explained rises from 9.56% to 16.53%; `s(sep_throw)` edf
+7.56, `s(closing_throw)` edf 6.39, `ti(sep_throw, depth_arr)` edf 3.00.
 Stage 3 is calibrated overall and in every depth bucket (§9.6), so the
 improvement is not overfit.
 
@@ -1351,9 +1361,9 @@ improvement is not overfit.
 
 | Depth (n) | Stage 2 log loss | Stage 3 − stage 2 | Share of stage 2 loss |
 |---|---|---|---|
-| 0–10 (7,953) | 0.5615 | −0.0477 [−0.0547, −0.0406] | 8.5% |
-| 10–20 (3,495) | 0.6623 | −0.0454 [−0.0557, −0.0350] | 6.9% |
-| 20+ (1,677) | 0.6481 | −0.0264 [−0.0375, −0.0151] | 4.1% |
+| 0–10 (7,953) | 0.5580 | −0.0476 [−0.0546, −0.0406] | 8.5% |
+| 10–20 (3,495) | 0.6576 | −0.0450 [−0.0551, −0.0346] | 6.9% |
+| 20+ (1,677) | 0.6367 | −0.0260 [−0.0365, −0.0153] | 4.1% |
 
 Separation still helps least on deep throws, where separation at the release
 says least about separation at the catch. That is what stage 4's time-based
@@ -1399,41 +1409,45 @@ get there first.
 
 | | $\Delta$ | 95% interval |
 |---|---|---|
-| Stage 4 − stage 3 (game) | **−0.0119** | [−0.0148, −0.0091] |
-| Stage 4 − stage 3 (week) | −0.0119 | [−0.0158, −0.0083] |
-| **Stage 4 − stage 2 (game)** | **−0.0563** | [−0.0622, −0.0503] |
-| Stage 4 − `cp` (game) | −0.0470 | [−0.0530, −0.0409] |
+| Stage 4 − stage 3 (game) | **−0.0116** | [−0.0144, −0.0087] |
+| Stage 4 − stage 3 (week) | −0.0116 | [−0.0153, −0.0080] |
+| **Stage 4 − stage 2 (game)** | **−0.0558** | [−0.0616, −0.0500] |
+| Stage 4 − `cp` (game) | −0.0513 | [−0.0573, −0.0451] |
 
-In-sample deviance explained rises from 15.75% to 17.75%; `s(lev_angle)` edf
-4.16, `s(tta_nearest)` edf 7.78, `s(window_margin)` edf 5.85. The week design
-effect for stage 4 − stage 3 is 2.12 (game: 1.20): the time-based features' gain
+In-sample deviance explained rises from 16.53% to 18.52%; `s(lev_angle)` edf
+4.24, `s(tta_nearest)` edf 7.70, `s(window_margin)` edf 6.01. The week design
+effect for stage 4 − stage 3 is 2.07 (game: 1.22): the time-based features' gain
 varies more by week than separation's did.
 
 **By depth** (game clusters):
 
 | Depth (n) | Stage 3 log loss | Stage 4 − stage 3 | Share of stage 3 loss |
 |---|---|---|---|
-| 0–10 (7,953) | 0.5138 | −0.0095 [−0.0125, −0.0066] | 1.9% |
-| 10–20 (3,495) | 0.6168 | −0.0172 [−0.0235, −0.0110] | 2.8% |
-| 20+ (1,677) | 0.6216 | −0.0124 [−0.0217, −0.0030] | 2.0% |
+| 0–10 (7,953) | 0.5103 | −0.0094 [−0.0123, −0.0065] | 1.8% |
+| 10–20 (3,495) | 0.6126 | −0.0176 [−0.0237, −0.0116] | 2.9% |
+| 20+ (1,677) | 0.6107 | −0.0096 [−0.0190, −0.0002] | 1.6% |
 
 The relative gain is largest at intermediate depth, not on deep throws as
 expected; on deep throws stage 3's separation-by-depth interaction had already
 captured part of what timing adds.
 
-**Calibration:** overall slope 0.988 [0.945, 1.033]; on deep throws 0.86
-[0.73, 0.996], slightly too spread out. **Reported, not corrected**: stage 4 is
+**Calibration:** overall slope 0.988 [0.945, 1.031]; on deep throws 0.86
+[0.74, 0.985], slightly too spread out. **Reported, not corrected**: stage 4 is
 the last stage, so adjusting it to its own out-of-fold results would be tuning
 with nothing downstream to protect.
 
-**The thesis comparison.** Stage 2 sees what `cp` sees, in the same model class
-as stages 3 and 4, so stage 4 − stage 2 answers the question: coverage geometry
-at the throw lowers out-of-fold log loss by 0.0563 nats [0.0503, 0.0622], more
-than the 0.0554 that the play-by-play features gain over the base rate.
-Separation accounts for 79% of it in the nested order, in which separation
-enters first, and leverage, time to arrival, and the passing window for the
-rest. Without an order, 36% is unique to separation, 21% unique to the geometry
-terms, and 43% shared (§9.12). `cp` sits between stages 2 and 3.
+**The thesis comparison.** Stage 2 sees what `cp` sees, plus the receiver's
+distance to the sideline, in the same model class as stages 3 and 4, so stage
+4 − stage 2 answers the question: coverage geometry at the throw lowers
+out-of-fold log loss by 0.0558 nats [0.0500, 0.0616], 93% of the 0.0602 that the
+play-by-play features gain over the base rate. With charted three-level
+location (§9.10) the two were 0.0563 and 0.0554: the location revision made the
+baseline stronger and left the tracking gain nearly unchanged, so the gain no
+longer exceeds the baseline's. Separation accounts for 79% of it in the nested
+order, in which separation enters first, and leverage, time to arrival, and
+the passing window for the rest. Without an order, 37% is unique to
+separation, 21% unique to the geometry terms, and 42% shared (§9.12). `cp`
+sits between stages 2 and 3.
 
 ### 9.10 Results on earlier populations
 
@@ -1445,7 +1459,13 @@ For the record; superseded by the sections above.
 | Targeted receiver, charted air yards, constant QB hit | 16,643 | −0.0613 [−0.0666, −0.0561] | +0.0077 [+0.0058, +0.0096] |
 | Targeted receiver, charted air yards, QB hit × depth | 16,643 | −0.0626 [−0.0678, −0.0573] | +0.0065 [+0.0048, +0.0083] |
 | + beyond the line, tracking depth (stages 1–3 inputs) | 13,145 | −0.0553 [−0.0613, −0.0495] | +0.0094 [+0.0072, +0.0116] |
-| **Final:** stages 1–4 inputs complete | 13,125 | −0.0554 [−0.0614, −0.0496] | +0.0093 [+0.0071, +0.0115] |
+| Stages 1–4 inputs complete, charted three-level `pass_location` | 13,125 | −0.0554 [−0.0614, −0.0496] | +0.0093 [+0.0071, +0.0115] |
+| **Final:** `pass_middle` + receiver sideline distance (§9.13) | 13,125 | −0.0602 [−0.0664, −0.0542] | +0.0045 [+0.0019, +0.0072] |
+
+On the charted-location specification the other headline numbers were: stage
+2 0.5994, stage 3 0.5550, stage 4 0.5431; stage 3 − stage 2 −0.0444 [−0.0495,
+−0.0392]; stage 4 − stage 3 −0.0119 [−0.0148, −0.0091]; stage 4 − stage 2
+−0.0563 [−0.0622, −0.0503]; stage 4 − `cp` −0.0470 [−0.0530, −0.0409].
 
 ### 9.11 Robustness
 
@@ -1455,33 +1475,42 @@ intervals as in §9.5. The baseline is scored from the predictions `09`
 persisted (§9.4), the same ones notebook 03 reports; each check refits with the
 same harness functions.
 
+On the adopted location specification (§9.13):
+
 | Check | n | Stage 2 log loss | Stage 4 − stage 2 | Stage 3 − stage 2 | Stage 4 − stage 3 |
 |---|---|---|---|---|---|
-| Baseline | 13,125 | 0.5994 | −0.0563 [−0.0622, −0.0503] | −0.0444 [−0.0495, −0.0392] | −0.0119 [−0.0148, −0.0091] |
-| R1 charted `air_yards` (and its zero indicator) | 13,125 | 0.5947 | −0.0546 [−0.0604, −0.0486] | −0.0438 [−0.0490, −0.0387] | −0.0108 [−0.0135, −0.0081] |
-| R2 p90 motion constants (stage 4 only) | 13,125 | 0.5994 | −0.0557 [−0.0616, −0.0498] | (as baseline) | −0.0113 [−0.0142, −0.0085] |
-| R3 without arrival fallbacks | 12,890 | 0.6011 | −0.0563 [−0.0624, −0.0501] | −0.0431 [−0.0482, −0.0379] | −0.0132 [−0.0164, −0.0100] |
-| R4 without kinematic defects | 12,778 | 0.6011 | −0.0562 [−0.0621, −0.0502] | −0.0447 [−0.0499, −0.0395] | −0.0115 [−0.0143, −0.0086] |
-| R5 without QB-hit plays | 11,927 | 0.5920 | −0.0561 [−0.0626, −0.0496] | −0.0443 [−0.0501, −0.0386] | −0.0118 [−0.0147, −0.0089] |
-| R6 without `at_window_edge` (outcome-selected) | 11,141 | 0.5947 | −0.0607 [−0.0672, −0.0542] | −0.0493 [−0.0552, −0.0433] | −0.0115 [−0.0144, −0.0084] |
+| Baseline | 13,125 | 0.5946 | −0.0558 [−0.0616, −0.0500] | −0.0442 [−0.0492, −0.0391] | −0.0116 [−0.0144, −0.0087] |
+| R1 charted `air_yards` (and its zero indicator) | 13,125 | 0.5892 | −0.0534 [−0.0592, −0.0476] | −0.0433 [−0.0483, −0.0382] | −0.0102 [−0.0128, −0.0075] |
+| R2 p90 motion constants (stage 4 only) | 13,125 | 0.5946 | −0.0552 [−0.0609, −0.0495] | (as baseline) | −0.0110 [−0.0138, −0.0082] |
+| R3 without arrival fallbacks | 12,890 | 0.5951 | −0.0554 [−0.0612, −0.0493] | −0.0428 [−0.0478, −0.0377] | −0.0126 [−0.0157, −0.0094] |
+| R4 without kinematic defects | 12,778 | 0.5964 | −0.0554 [−0.0612, −0.0495] | −0.0444 [−0.0494, −0.0393] | −0.0110 [−0.0138, −0.0082] |
+| R5 without QB-hit plays | 11,927 | 0.5876 | −0.0556 [−0.0617, −0.0493] | −0.0442 [−0.0499, −0.0386] | −0.0113 [−0.0142, −0.0084] |
+| R6 without `at_window_edge` (outcome-selected) | 11,141 | 0.5901 | −0.0601 [−0.0664, −0.0537] | −0.0494 [−0.0551, −0.0435] | −0.0108 [−0.0138, −0.0077] |
+| R7 charted three-level `pass_location` | 13,125 | 0.5994 | −0.0563 [−0.0622, −0.0503] | −0.0444 [−0.0495, −0.0392] | −0.0119 [−0.0148, −0.0091] |
 
-**The thesis comparison is robust.** Across R1–R5, stage 4 − stage 2 lies
-between −0.0546 and −0.0563, every interval far from zero and overlapping the
-baseline.
+**The thesis comparison is robust.** Across every check but R6, stage 4 −
+stage 2 lies between −0.0534 and −0.0563, every interval far from zero and
+overlapping the baseline.
 
-- **R1.** Charted `air_yards` gives a slightly *stronger* stage 2 (0.5947
-  against 0.5994): the charter records the catch or target point, which the
+- **R1.** Charted `air_yards` gives a slightly *stronger* stage 2 (0.5892
+  against 0.5946): the charter records the catch or target point, which the
   last in-flight frame approximates. The geometry's gain over that baseline is
-  essentially unchanged.
+  0.0534, the smallest of any check, and still far from zero.
 - **R2.** The p90 constants (`PLAYER_S_MAX_P90` 9.98 yd/s, `PLAYER_A_MAX_P90`
   6.50 yd/s²) make stage 4 slightly *worse* than the median ones, by 0.0006
-  [0.0003, 0.0010] nats, and leave the gain unchanged.
+  [0.0002, 0.0010] nats, and leave the gain unchanged.
 - **R3–R5.** Dropping arrival fallbacks (§6.6), plays with defects outside the
   measurement window (§4.2), or QB-hit plays (§7, with the QB-hit term removed)
   changes nothing.
 - **R6.** Larger gain, but these are mostly completions with a long carry, so
   excluding them selects on the outcome (base rate 0.638 → 0.627). Reported
   for completeness, not as evidence.
+- **R7.** The charted three-level location reproduces the pre-revision
+  numbers exactly (§9.10), which also checks the harness. The location
+  revision lowers stage 2's loss by 0.0048 and the tracking gain by 0.0005.
+
+The table on the charted-location specification, before §9.13, had the same
+conclusions: stage 4 − stage 2 between −0.0546 and −0.0563 across R1–R5.
 
 Implementation: `07` writes `tta_nearest_p90` and `window_margin_p90` from the
 same function as the main timing features, and `08` carries them, with charted
@@ -1494,16 +1523,21 @@ or block of terms, on the same leave-one-week-out folds, and reports the rise
 in out-of-fold log loss with a game-cluster interval: the term's contribution
 given all the others. Diagnostic only; no spec changed.
 
+Numbers are on the adopted location specification (§9.13). On the charted
+three-level specification, where this analysis was first run, every row was
+within 0.0013 of these and the conclusions were the same; only closing speed
+and time to arrival swapped order (0.0077 and 0.0079 then).
+
 | Dropped from stage 4 | Rise in log loss |
 |---|---|
-| separation, `s(sep_throw)` + `ti(sep_throw, depth_arr)` | 0.0165 [0.0132, 0.0199] |
-| time to arrival, `s(tta_nearest)` | 0.0079 [0.0057, 0.0100] |
-| closing speed, `s(closing_throw)` | 0.0077 [0.0055, 0.0098] |
-| passing window, `s(window_margin)` | 0.0030 [0.0017, 0.0043] |
-| separation × depth, `ti(sep_throw, depth_arr)` alone | 0.0011 [0.0001, 0.0021] |
-| leverage angle, `s(lev_angle)` | 0.0008 [0.0001, 0.0015] |
-| **separation block** (the stage 3 terms) | 0.0204 [0.0167, 0.0242] |
-| **geometry block** (the stage 4 terms; = stage 4 − stage 3, §9.9) | 0.0119 [0.0091, 0.0148] |
+| separation, `s(sep_throw)` + `ti(sep_throw, depth_arr)` | 0.0167 [0.0133, 0.0202] |
+| closing speed, `s(closing_throw)` | 0.0082 [0.0059, 0.0104] |
+| time to arrival, `s(tta_nearest)` | 0.0066 [0.0045, 0.0087] |
+| passing window, `s(window_margin)` | 0.0034 [0.0020, 0.0048] |
+| separation × depth, `ti(sep_throw, depth_arr)` alone | 0.0012 [0.0002, 0.0022] |
+| leverage angle, `s(lev_angle)` | 0.0010 [0.0003, 0.0018] |
+| **separation block** (the stage 3 terms) | 0.0207 [0.0169, 0.0246] |
+| **geometry block** (the stage 4 terms; = stage 4 − stage 3, §9.9) | 0.0116 [0.0087, 0.0144] |
 
 Separation and its depth interaction are dropped together because `ti()` is
 built to sit alongside its main effects. The geometry-block row reproduces
@@ -1511,32 +1545,32 @@ built to sit alongside its main effects. The geometry-block row reproduces
 
 **Every term earns its place.** No interval includes zero, so none is a
 removal candidate. Leverage angle and the separation-by-depth interaction are
-the weakest, both with lower bounds at 0.0001; the interaction is kept for the
-deep-throw calibration it was added for (§9.8), and leverage has the lowest
-concurvity of any tracking term (worst 0.39), so it carries little but carries
+the weakest, with lower bounds of 0.0002 and 0.0003; the interaction is kept
+for the deep-throw calibration it was added for (§9.8), and leverage has the
+lowest concurvity of any tracking term (worst 0.41), so it carries little but carries
 something the others do not.
 
 **The 79% attribution in §9.9 depends on order.** It credits separation with
 all of stage 3 − stage 2 because separation enters first. Decomposing stage 4 −
-stage 2 (0.0563) without an order:
+stage 2 (0.0558) without an order:
 
 | Part | Nats | Share |
 |---|---|---|
-| unique to separation (separation block) | 0.0204 | 36% |
-| unique to the geometry terms (geometry block) | 0.0119 | 21% |
-| shared: either block recovers it without the other | 0.0240 | 43% |
+| unique to separation (separation block) | 0.0207 | 37% |
+| unique to the geometry terms (geometry block) | 0.0116 | 21% |
+| shared: either block recovers it without the other | 0.0235 | 42% |
 
-The shared part is 0.0444 − 0.0204, stage 3's gain over stage 2 less what
+The shared part is 0.0442 − 0.0207, stage 3's gain over stage 2 less what
 separation adds once the geometry terms are present. Separation and the timing
 features are partly the same information: the nearest defender's time margin
 is largely its distance expressed in time.
 
 **The three geometry terms are nearly additive**: their drop-one rises sum to
-0.0117 against the block's 0.0119. The overlap is between blocks, not within
+0.0110 against the block's 0.0116. The overlap is between blocks, not within
 the geometry block.
 
 **Concurvity** (stage 4 fit on all rows, `worst`): no tracking smooth exceeds
-0.67 against all other terms (`s(tta_nearest)`), so nothing is redundant.
+0.68 against all other terms (`s(tta_nearest)`), so nothing is redundant.
 The largest pairwise values are `s(sep_throw)` with its interaction (0.43, by
 construction), `s(window_margin)` with `s(depth_arr)` (0.40: longer throws give
 help defenders more time), `s(sep_throw)` with `s(tta_nearest)` (0.38), and
@@ -1622,7 +1656,7 @@ stated:
   yd, 1.161 to 1.057 (both) at 10–20 yd, and 0.837 to 0.888 (B) and 0.860 (C)
   at 20+ yd.
 
-**Round two.** Two revisions, argued before fitting:
+**Round two.** Revisions argued before fitting:
 
 - **`lat_arr` is dropped.** It adds nothing over the charted variable and is
   flat once sideline distance is present.
@@ -1661,7 +1695,15 @@ stated:
   at 10–20 yd, and 0.837 to 0.910 at 20+ yd, the best deep-throw slope of any
   candidate.
 
-Not yet adopted.
+**Adopted: F** — `pass_middle + s(sideline_rec)` in place of
+`pass_location` in stages 2–4 (§9.3), with `sideline_rec` unclamped. Clamping
+was justified for the ball, whose position out of bounds is a missed throw;
+for the receiver it would add an arbitrary choice for 0.0004 nats, since a
+tracked position slightly out of bounds is often a toe-tap catch with the
+shoulder-pad sensor over the line. G is the sensitivity. Charted three-level
+`pass_location` becomes a robustness refit (R7, §9.11). `09` reproduces F's
+predictions, which notebook 07 asserts. Headline numbers on the adopted
+specification are in §9.5–9.9; those on the charted one in §9.10.
 
 ## 10. Known technical constraints
 

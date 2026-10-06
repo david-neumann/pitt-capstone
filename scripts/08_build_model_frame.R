@@ -16,8 +16,9 @@
 # Also carried, for analysis/05_robustness.qmd: charted `air_yards` and
 # `yards_to_go` (to rebuild distance to the sticks from charted depth), the
 # p90-motion-constant timing features, and the arrival and defect
-# diagnostics. `lat_arr`, `sideline_arr`, `sideline_rec`, and
-# `pass_middle` are carried as candidate replacements for `pass_location`
+# diagnostics. Charted `pass_location`, `lat_arr`, and the ball's
+# `sideline_arr` are carried for the location comparison in
+# analysis/07_lateral_location.qmd and the robustness refit
 # (notes/decisions.md §9.13).
 #
 # Outputs, in data/processed/:
@@ -162,10 +163,9 @@ model_frame <- prepared[
     window_n_pos,
     tta_nearest_p90,
     window_margin_p90,
+    pass_location,
     lat_arr,
     sideline_arr,
-    sideline_rec,
-    pass_middle,
     used_fallback,
     at_window_edge,
     has_kinematic_defect,

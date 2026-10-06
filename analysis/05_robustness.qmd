@@ -48,8 +48,8 @@ source(here("R", "evaluate.R"))
 
 `analysis/03_model_baseline.qmd` scores four nested stages on
 `model_frame.parquet` and finds that coverage geometry at the throw (stage 4)
-improves on the play-by-play baseline (stage 2) by more than the play-by-play
-features improve on the base rate. This notebook checks whether that comparison
+improves on the play-by-play baseline (stage 2) by nearly as much as the
+play-by-play features improve on the base rate. This notebook checks whether that comparison
 depends on choices made along the way (`notes/decisions.md` §6.7, §7):
 
 | Check | Change |
@@ -60,6 +60,7 @@ depends on choices made along the way (`notes/decisions.md` §6.7, §7):
 | R4 | Without plays with a kinematic defect outside the snap-to-throw window |
 | R5 | Without plays with a QB hit (the QB-hit term leaves the specs) |
 | R6 | Without plays whose closest approach is at the last searched frame |
+| R7 | Charted three-level `pass_location` instead of `pass_middle` and the receiver's sideline distance |
 
 Each check refits the stages with leave-one-week-out cross-validation and reports
 the paired differences in out-of-fold log loss with game-cluster bootstrap
@@ -235,6 +236,27 @@ With the p90 constants, stage 4's out-of-fold log loss changes by
 `r sprintf("%+.4f", d_p90$estimate)` [`r sprintf("%+.4f", d_p90$conf_low)`,
 `r sprintf("%+.4f", d_p90$conf_high)`] nats against the median constants.
 
+## 2.3 R7: charted pass location
+
+Stage 2 codes location as middle or not plus a smooth in the targeted
+receiver's distance to the sideline (`notes/decisions.md` §9.13). R7 restores
+the charted three-level `pass_location` in their place, in every stage.
+
+```{r}
+#| label: r7-location
+
+specs_loc <- edit_terms(
+  stage_specs,
+  . ~ . - pass_middle - s(sideline_rec) + pass_location
+)
+# update() leaves a misspelled term in place silently.
+stopifnot(!any(map_lgl(specs_loc, \(s) {
+  any(c("pass_middle", "sideline_rec") %in% all.vars(s$formula))
+})))
+
+r7 <- run(mf, specs_loc, "R7 charted pass_location")
+```
+
 # 3. Sample choices
 
 ```{r}
@@ -262,7 +284,8 @@ results <- bind_rows(
   r3$result,
   r4$result,
   r5$result,
-  r6$result
+  r6$result,
+  r7$result
 ) |>
   mutate(scenario = fct_inorder(scenario))
 
@@ -321,7 +344,8 @@ ggsave(
 p_rob
 ```
 
-**The tracking gain does not depend on any of these choices.** Across R1–R5,
+**The tracking gain does not depend on any of these choices.** Across every
+check but R6,
 stage 4 improves on stage 2 by between
 `r sprintf("%.4f", -max(results$estimate[results$comparison == "stage 4 - stage 2" & !startsWith(as.character(results$scenario), "R6")]))`
 and
@@ -355,3 +379,11 @@ stable.
   `r sprintf("%.3f", rs("R6", "stage 4 - stage 2", "base_rate"))` and changes the
   population on the outcome. It is not evidence either way; it shows only that
   these plays are not where the gain comes from.
+- **R7, charted pass location.** With the three charted levels in place of
+  `pass_middle` and the sideline distance, stage 2's log loss is
+  `r sprintf("%.4f", rs("R7", "stage 4 - stage 2", "ll_stage2"))` against
+  `r sprintf("%.4f", rs("baseline", "stage 4 - stage 2", "ll_stage2"))`, and the
+  geometry's gain over it is `r sprintf("%.4f", -rs("R7", "stage 4 - stage 2"))`
+  [`r sprintf("%.4f", -rs("R7", "stage 4 - stage 2", "conf_high"))`,
+  `r sprintf("%.4f", -rs("R7", "stage 4 - stage 2", "conf_low"))`]: the
+  stronger location baseline costs the tracking features little.

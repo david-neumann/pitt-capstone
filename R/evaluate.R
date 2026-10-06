@@ -124,7 +124,11 @@ prepare_model_frame <- function(
 #'   rather than charted `air_yards`. The `air_yards == 0` indicator is
 #'   dropped with it: it captured a charting convention, and the tracking
 #'   depth is continuous.
-#' - `pass_location` keeps three levels rather than middle/not-middle.
+#' - Location is middle or not (`pass_middle`), as in `cp`, plus a smooth
+#'   in the targeted receiver's distance to the nearer sideline at the
+#'   arrival frame (`sideline_rec`), which `cp` does not have. The
+#'   receiver's position rather than the ball's, so that a ball sailing
+#'   out of bounds does not enter as location (notes/decisions.md §9.13).
 #' - `number_of_pass_rushers` is added as a defensive control.
 #' - `roof` and era are omitted.
 #' - `offense_formation` is excluded: it describes scheme rather than
@@ -167,7 +171,8 @@ MODEL_SPECS <- list(
       s(number_of_pass_rushers, k = 5) +
       s(depth_arr, by = qb_hit) +
       down +
-      pass_location +
+      pass_middle +
+      s(sideline_rec) +
       shotgun +
       home
   ),
@@ -181,7 +186,8 @@ MODEL_SPECS <- list(
       s(number_of_pass_rushers, k = 5) +
       s(depth_arr, by = qb_hit) +
       down +
-      pass_location +
+      pass_middle +
+      s(sideline_rec) +
       shotgun +
       home +
       s(sep_throw) +
@@ -198,7 +204,8 @@ MODEL_SPECS <- list(
       s(number_of_pass_rushers, k = 5) +
       s(depth_arr, by = qb_hit) +
       down +
-      pass_location +
+      pass_middle +
+      s(sideline_rec) +
       shotgun +
       home +
       s(sep_throw) +

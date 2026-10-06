@@ -161,7 +161,7 @@ on the same rows.
 ## 1.2 Derived predictors
 
 `prepare_model_frame()` in `R/evaluate.R`, applied by `08`, adds the response
-and two derived columns, so that every stage and the benchmark see identical
+and derived columns, so that every stage and the benchmark see identical
 inputs:
 
 - `complete` is 1 for C and 0 for I and IN. An interception counts as an
@@ -169,6 +169,11 @@ inputs:
   benchmark comparison meaningful.
 - `dist_to_sticks = depth_arr - yards_to_go` replaces `yards_to_go`.
 - `home` is 1 when the offense is at home.
+- `pass_middle` is 1 when charted `pass_location` is middle, the coding `cp`
+  uses.
+- `sideline_rec` is the targeted receiver's distance to the nearer sideline
+  at the arrival frame, negative when the receiver's tracked position is out
+  of bounds.
 
 It also clamps `number_of_pass_rushers` to [2, 7] and lumps rare factor levels;
 the reasoning is in that file and in `notes/decisions.md` §9.2.
@@ -316,12 +321,16 @@ confounded by depth, and conditioning on depth inverts it. This coefficient was
 `offense_formation`: an empty-backfield snap is essentially always from shotgun,
 so the two were aliased and the standard error on `shotgun` was $0.349$.
 
-`pass_location` is kept at three levels. Against left, middle is
-`r b("pass_locationmiddle")` and right `r b("pass_locationright")`
-($p$ = `r b("pass_locationright", "Pr(>|z|)")`): middle differs from both
-sides, while left and right are not distinguishable in this population. The
-coding is kept by argument rather than revised on a $p$-value
-(`notes/decisions.md` §9.3).
+**Location is two terms.** `pass_middle` is middle or not, as in `cp`: left
+and right are not distinguishable, and there is no football argument for them
+to differ. The field boundary enters separately, as a smooth in the targeted
+receiver's distance to the sideline (§3.2). Conditional on it, a throw to the
+middle is `r b("pass_middle", digits = 3)` on the logit scale (SE
+`r b("pass_middle", "Std. Error", 3)`), so the middle carries something the
+boundary does not. The comparison that led here, against charted three-level
+`pass_location` and the ball's own position, is in
+`analysis/07_lateral_location.qmd` (`notes/decisions.md` §9.13); the charted
+coding is a robustness refit in `analysis/05_robustness.qmd`.
 
 ## 3.2 Reading the smooths
 
@@ -403,6 +412,37 @@ Including `qb_hit` at all, rather than excluding hit plays, follows
 `notes/decisions.md` §7: the flag does not distinguish "hit during the throw"
 from "hit afterwards," so filtering on it would remove real passes and may
 itself select on outcome.
+
+**The sideline matters only near it.** `s(sideline_rec)` is the targeted
+receiver's distance to the nearer sideline when the ball arrives. Measured at
+the receiver rather than the ball, so that a ball sailing out of bounds, a
+missed throw decided after the release, does not enter as location.
+
+```{r}
+#| label: sideline-effect
+
+side_d <- c(0, 2, 4, 10)
+side_nd <- mf_complete[rep(1, length(side_d)), ] |>
+  mutate(sideline_rec = side_d)
+side_tm <- predict(f2, newdata = side_nd, type = "terms", se.fit = TRUE)
+side_eff <- tibble(
+  sideline_rec = side_d,
+  effect = side_tm$fit[, "s(sideline_rec)"],
+  se = side_tm$se.fit[, "s(sideline_rec)"]
+)
+
+side_eff |>
+  gt() |>
+  tab_header(title = "Sideline-distance term on the logit, by distance (yd)") |>
+  fmt_number(columns = c(effect, se), decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+
+se_at <- function(d) sprintf("%.2f", side_eff$effect[side_eff$sideline_rec == d])
+```
+
+The term is `r se_at(10)` at 10 yards from the sideline, `r se_at(4)` at 4,
+`r se_at(2)` at 2, and `r se_at(0)` on the line: flat across most of the
+field, then falling steeply over the last few yards.
 
 ```{r}
 #| label: gam-check
@@ -1042,12 +1082,12 @@ interval contains zero. `cp` underpredicts on short throws
 [`r sprintf("%.3f", bk("cp", "0-10", "citl", "conf_low"))`,
 `r sprintf("%.3f", bk("cp", "0-10", "citl", "conf_high"))`]).
 
-**Stage 2's slopes are within sampling error of 1 except at intermediate
-depth**, where its predictions are slightly too timid
-(`r sprintf("%.3f", bk("2. play-by-play", "10-20", "slope"))`
+**Stage 2's slopes are within sampling error of 1 at every depth**: at
+intermediate depth
+`r sprintf("%.3f", bk("2. play-by-play", "10-20", "slope"))`
 [`r sprintf("%.3f", bk("2. play-by-play", "10-20", "slope", "conf_low"))`,
-`r sprintf("%.3f", bk("2. play-by-play", "10-20", "slope", "conf_high"))`]). On
-deep throws the slope is
+`r sprintf("%.3f", bk("2. play-by-play", "10-20", "slope", "conf_high"))`], and
+on deep throws
 `r sprintf("%.2f", bk("2. play-by-play", "20+", "slope"))`
 [`r sprintf("%.2f", bk("2. play-by-play", "20+", "slope", "conf_low"))`,
 `r sprintf("%.2f", bk("2. play-by-play", "20+", "slope", "conf_high"))`]; on
@@ -1709,13 +1749,15 @@ money |>
 ```
 
 The thesis is that tracking geometry adds information beyond play-by-play.
-Stage 2 sees what `cp` sees, in the same model class as stages 3 and 4, so the
+Stage 2 sees what `cp` sees, plus the receiver's distance to the sideline, in
+the same model class as stages 3 and 4, so the
 comparison that answers the question is stage 4 against stage 2: coverage
 geometry at the throw lowers out-of-fold log loss by
 `r sprintf("%.4f", -d42$estimate)` nats
-[`r sprintf("%.4f", -d42$conf_high)`, `r sprintf("%.4f", -d42$conf_low)`], more
-than the `r sprintf("%.4f", -dg$estimate)` that the play-by-play features gain
-over the base rate. Separation accounts for
+[`r sprintf("%.4f", -d42$conf_high)`, `r sprintf("%.4f", -d42$conf_low)`],
+`r percent(d42$estimate / dg$estimate, accuracy = 1)` of the
+`r sprintf("%.4f", -dg$estimate)` that the play-by-play features gain over the
+base rate. Separation accounts for
 `r percent(d32$estimate / d42$estimate, accuracy = 1)` of that in the nested
 order, in which it enters first, and leverage, time to arrival, and the passing
 window for the rest. The split depends on the order: much of separation's gain
