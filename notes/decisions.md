@@ -1569,6 +1569,27 @@ is largely its distance expressed in time.
 0.0110 against the block's 0.0116. The overlap is between blocks, not within
 the geometry block.
 
+**Stage 2 features, measured the same way** (descriptive only; baseline terms
+are not cut on these numbers, §9.3):
+
+| Dropped from stage 4 | Rise in log loss |
+|---|---|
+| throw location, `pass_middle` + `s(sideline_rec)` | 0.0051 [0.0034, 0.0069] |
+| throw depth, `s(depth_arr)` + `s(dist_to_sticks)` + `ti(sep_throw, depth_arr)` | 0.0051 [0.0033, 0.0069] |
+| QB hit, `s(depth_arr, by = qb_hit)` | 0.0034 [0.0018, 0.0049] |
+| field position, `s(los_x)` | 0.0007 [−0.0001, 0.0014] |
+| shotgun | 0.0002 [−0.0001, 0.0006] |
+| down | 0.0000 [−0.0003, 0.0003] |
+| home | 0.0000 [−0.0003, 0.0003] |
+| pass rushers, `s(number_of_pass_rushers, k = 5)` | −0.0001 [−0.0001, 0.0000] |
+
+Throw depth drops the separation-by-depth interaction too, which would
+otherwise carry depth without its main effect. Given everything else in stage
+4, field position, shotgun, down, home, and the pass-rusher count add nothing
+measurable; the top three features in the whole model are the tracking
+features separation, closing speed, and time to arrival. Figure:
+`figs/week07/feature_contributions.png`.
+
 **Concurvity** (stage 4 fit on all rows, `worst`): no tracking smooth exceeds
 0.68 against all other terms (`s(tta_nearest)`), so nothing is redundant.
 The largest pairwise values are `s(sep_throw)` with its interaction (0.43, by

@@ -101,6 +101,15 @@ row.
 The geometry block, all three stage 4 terms, is stage 4 against stage 3 and
 needs no refit.
 
+**Stage 2's features are measured the same way**, to show which features the
+model leans on overall. These rows are descriptive: baseline terms are chosen
+by argument, never cut on numbers like these (`notes/decisions.md` §9.3). Throw
+depth drops `s(depth_arr)`, `s(dist_to_sticks)` (depth minus yards to go), and
+the separation-by-depth interaction together, since the interaction would
+otherwise carry depth without its main effect; depth still enters through the
+QB-hit smooth. Throw location drops `pass_middle` and `s(sideline_rec)`
+together.
+
 ```{r}
 #| label: units
 
@@ -118,7 +127,36 @@ units <- list(
     "s(sep_throw)",
     "s(closing_throw)",
     "ti(sep_throw, depth_arr)"
-  )
+  ),
+  `throw depth` = c(
+    "s(depth_arr)",
+    "s(dist_to_sticks)",
+    "ti(sep_throw, depth_arr)"
+  ),
+  `QB hit` = "s(depth_arr, by = qb_hit)",
+  `pass rushers` = "s(number_of_pass_rushers, k = 5)",
+  `field position` = "s(los_x)",
+  down = "down",
+  `throw location` = c("pass_middle", "s(sideline_rec)"),
+  shotgun = "shotgun",
+  home = "home"
+)
+
+stage_of <- c(
+  `separation (s + ti)` = "stage 3",
+  `separation x depth (ti)` = "stage 3",
+  `closing speed` = "stage 3",
+  `leverage angle` = "stage 4",
+  `time to arrival` = "stage 4",
+  `passing window` = "stage 4",
+  `throw depth` = "stage 2",
+  `QB hit` = "stage 2",
+  `pass rushers` = "stage 2",
+  `field position` = "stage 2",
+  down = "stage 2",
+  `throw location` = "stage 2",
+  shotgun = "stage 2",
+  home = "stage 2"
 )
 
 # Remove terms by label, keeping the formula's environment so that bare s()
@@ -146,7 +184,8 @@ stopifnot(
 
 # 2. Contributions
 
-Each row refits stage 4 seventeen times; this chunk is the notebook's cost.
+Each row refits stage 4 seventeen times; this chunk is the notebook's cost,
+about 20 minutes.
 
 ```{r}
 #| label: refit
@@ -216,6 +255,94 @@ contrib |>
   ) +
   theme_minimal(base_size = 12) +
   theme(legend.position = "bottom")
+```
+
+For the slides: one bar per feature, coloured by the stage that adds it. The
+separation-by-depth interaction is left out because the separation bar
+already includes it.
+
+```{r}
+#| label: feature-contributions-figure
+#| fig-height: 5
+
+feature_labels <- c(
+  `separation (s + ti)` = "Separation",
+  `closing speed` = "Closing speed",
+  `time to arrival` = "Time to arrival",
+  `passing window` = "Passing window",
+  `leverage angle` = "Leverage",
+  `throw depth` = "Throw depth",
+  `QB hit` = "QB hit",
+  `pass rushers` = "Pass rushers",
+  `field position` = "Field position",
+  down = "Down",
+  `throw location` = "Throw location",
+  shotgun = "Shotgun",
+  home = "Home"
+)
+
+feat <- contrib |>
+  filter(unit %in% names(feature_labels)) |>
+  mutate(
+    feature = fct_reorder(feature_labels[unit], estimate),
+    stage = stage_of[unit]
+  )
+
+p_feat <- ggplot(feat, aes(estimate, feature, fill = stage)) +
+  geom_col(width = 0.6) +
+  geom_errorbar(
+    aes(xmin = conf_low, xmax = conf_high),
+    width = 0.25,
+    colour = "grey35",
+    linewidth = 0.4
+  ) +
+  geom_text(
+    aes(x = pmax(conf_high, estimate), label = sprintf("%.4f", estimate)),
+    hjust = -0.2,
+    size = 3.2,
+    colour = "grey15"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "stage 2" = "#2a78d6",
+      "stage 3" = "#eb6834",
+      "stage 4" = "#1baf7a"
+    ),
+    labels = c(
+      "stage 2" = "stage 2 (baseline)",
+      "stage 3" = "stage 3 (separation)",
+      "stage 4" = "stage 4 (geometry)"
+    ),
+    name = NULL
+  ) +
+  scale_x_continuous(
+    limits = c(min(0, min(feat$conf_low)), max(feat$conf_high) * 1.2),
+    expand = c(0, 0)
+  ) +
+  labs(
+    title = "How much worse the model gets without each feature",
+    subtitle = "Rise in out-of-fold log loss when the feature is removed from stage 4; bars show 95% intervals",
+    x = "rise in log loss",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "top",
+    legend.justification = "left"
+  )
+
+dir.create(here("figs", "week07"), showWarnings = FALSE)
+ggsave(
+  here("figs", "week07", "feature_contributions.png"),
+  p_feat,
+  width = 8,
+  height = 5,
+  dpi = 200
+)
+
+p_feat
 ```
 
 # 3. Overlap between terms

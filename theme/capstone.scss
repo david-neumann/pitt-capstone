@@ -55,3 +55,9 @@ code:not(.sourceCode) {
 .reveal section.tighter {
   font-size: 0.85em;
 }
+
+// Slides that carry a long code block: shrink the code, not the prose.
+.reveal section.code-small pre > code.sourceCode {
+  font-size: 0.68em;
+  line-height: 1.35;
+}

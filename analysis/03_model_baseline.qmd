@@ -254,6 +254,51 @@ tibble(
   gt_theme_538(quiet = TRUE)
 ```
 
+```{r}
+#| label: cv-diagram
+#| fig-height: 5
+
+cv_grid <- tidyr::expand_grid(
+  fit = seq_along(folds$held_out),
+  week = sort(unique(mf_complete$week))
+) |>
+  mutate(
+    role = factor(
+      if_else(week == folds$held_out[fit], "predicted", "trained on"),
+      levels = c("trained on", "predicted")
+    )
+  )
+
+p_cv <- ggplot(cv_grid, aes(week, fit, fill = role)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  scale_fill_manual(
+    values = c("trained on" = "#dfe6ee", "predicted" = "#2a78d6"),
+    name = NULL
+  ) +
+  scale_x_continuous(breaks = 1:17, expand = c(0, 0)) +
+  scale_y_reverse(breaks = 1:17, expand = c(0, 0)) +
+  coord_equal() +
+  labs(
+    title = "Leave-one-week-out cross-validation",
+    subtitle = "17 fits: each trains on 16 weeks and predicts the week it never saw",
+    x = "week of the 2018 season",
+    y = "fit"
+  ) +
+  theme_minimal() +
+  theme(panel.grid = element_blank(), legend.position = "top")
+
+dir.create(here("figs", "week07"), showWarnings = FALSE)
+ggsave(
+  here("figs", "week07", "cv_folds.png"),
+  p_cv,
+  width = 7,
+  height = 5.5,
+  dpi = 200
+)
+
+p_cv
+```
+
 The `test_n` total equals the scoring population exactly, which is the property
 that makes the pooled out-of-fold predictions in §4 a complete prediction for
 every play: each one is predicted exactly once, by a fit that never saw its
@@ -1720,6 +1765,168 @@ slightly too spread out there. This is reported rather than corrected. Stage 4
 is the last stage, so adjusting it to its own out-of-fold results would be
 tuning with nothing downstream to protect (`notes/decisions.md` §9.9).
 
+**Tracking makes the predictions more decisive without making them less
+honest.** Stage 4's binned predictions reach further toward 0 and 1 than
+stage 2's and stay on the diagonal:
+
+```{r}
+#| label: calibration-stage2-vs-4
+#| fig-height: 4.5
+
+cal_models <- c(
+  "2. play-by-play" = "Situation + throw (stage 2)",
+  "4. + geometry" = "+ coverage (stage 4)"
+)
+
+curves24 <- map(names(cal_models), \(m) {
+  d <- filter(preds_s4, model == m)
+  cc <- calibration_curve(d$complete, d$.pred)
+  list(
+    bins = mutate(cc$bins, model = cal_models[[m]]),
+    smooth = mutate(cc$smooth, model = cal_models[[m]])
+  )
+})
+bins24 <- list_rbind(map(curves24, "bins")) |>
+  mutate(model = factor(model, levels = cal_models))
+smooth24 <- list_rbind(map(curves24, "smooth")) |>
+  mutate(model = factor(model, levels = cal_models))
+
+p_cal24 <- ggplot() +
+  geom_abline(linetype = "dashed", linewidth = 0.4, colour = "grey50") +
+  geom_ribbon(
+    data = smooth24,
+    aes(pred, ymin = low, ymax = high),
+    fill = "grey70",
+    alpha = 0.5
+  ) +
+  geom_line(data = smooth24, aes(pred, obs), linewidth = 0.6) +
+  geom_pointrange(
+    data = bins24,
+    aes(
+      mean_pred,
+      obs_rate,
+      ymin = obs_rate - 1.96 * se,
+      ymax = obs_rate + 1.96 * se
+    ),
+    size = 0.15,
+    colour = "#1f4fd8"
+  ) +
+  facet_wrap(~model) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Predicted vs. observed completion rate, out of fold",
+    subtitle = "Points: 20 equal-size groups of throws. On the dashed line, predictions are honest",
+    x = "predicted chance of completion",
+    y = "observed completion rate"
+  ) +
+  theme_minimal()
+
+dir.create(here("figs", "week07"), showWarnings = FALSE)
+ggsave(
+  here("figs", "week07", "calibration_stage2_vs_4.png"),
+  p_cal24,
+  width = 8,
+  height = 4.5,
+  dpi = 200
+)
+
+p_cal24
+
+# Confident predictions: below 40% or above 80%.
+confident <- preds_s4 |>
+  filter(model %in% names(cal_models)) |>
+  group_by(model) |>
+  summarize(
+    share_confident = mean(.pred < 0.4 | .pred > 0.8),
+    share_low = mean(.pred < 0.4),
+    observed_low = mean(complete[.pred < 0.4]),
+    share_high = mean(.pred > 0.8),
+    observed_high = mean(complete[.pred > 0.8]),
+    .groups = "drop"
+  )
+
+confident |>
+  gt() |>
+  tab_header(title = "Throws given a confident prediction (below 40% or above 80%)") |>
+  fmt_percent(columns = -model, decimals = 1) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+By depth, with ten bins per bucket because the deep bucket holds
+`r comma(sum(d_s4$bucket == "20+"))` throws:
+
+```{r}
+#| label: calibration-stage4-by-depth
+#| fig-height: 4
+
+depth_labels <- c(
+  "0-10" = "Up to 10 yards",
+  "10-20" = "10 to 20 yards",
+  "20+" = "More than 20 yards"
+)
+
+curves4d <- d_s4 |>
+  group_split(bucket) |>
+  map(\(d) {
+    b <- as.character(d$bucket[1])
+    lab <- sprintf("%s (n = %s)", depth_labels[[b]], comma(nrow(d)))
+    cc <- calibration_curve(d$complete, d$.pred, n_bins = 10)
+    list(
+      bins = mutate(cc$bins, depth = lab),
+      smooth = mutate(cc$smooth, depth = lab)
+    )
+  })
+depth_levels <- map_chr(curves4d, \(x) x$bins$depth[1])
+bins4d <- list_rbind(map(curves4d, "bins")) |>
+  mutate(depth = factor(depth, levels = depth_levels))
+smooth4d <- list_rbind(map(curves4d, "smooth")) |>
+  mutate(depth = factor(depth, levels = depth_levels))
+
+p_cal4d <- ggplot() +
+  geom_abline(linetype = "dashed", linewidth = 0.4, colour = "grey50") +
+  geom_ribbon(
+    data = smooth4d,
+    aes(pred, ymin = low, ymax = high),
+    fill = "grey70",
+    alpha = 0.5
+  ) +
+  geom_line(data = smooth4d, aes(pred, obs), linewidth = 0.6) +
+  geom_pointrange(
+    data = bins4d,
+    aes(
+      mean_pred,
+      obs_rate,
+      ymin = obs_rate - 1.96 * se,
+      ymax = obs_rate + 1.96 * se
+    ),
+    size = 0.15,
+    colour = "#1f4fd8"
+  ) +
+  facet_wrap(~depth) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Stage 4: predicted vs. observed completion rate, by throw depth",
+    subtitle = "Points: 10 equal-size groups of throws per panel. On the dashed line, predictions are honest",
+    x = "predicted chance of completion",
+    y = "observed completion rate"
+  ) +
+  theme_minimal()
+
+ggsave(
+  here("figs", "week07", "calibration_stage4_by_depth.png"),
+  p_cal4d,
+  width = 10,
+  height = 4,
+  dpi = 200
+)
+
+p_cal4d
+```
+
 ## 10.6 The money table
 
 ```{r}
@@ -1731,7 +1938,10 @@ money <- preds_s4 |>
   arrange(desc(log_loss)) |>
   mutate(
     vs_intercept = log_loss - log_loss[model == "1. intercept"],
-    vs_stage2 = log_loss - log_loss[model == "2. play-by-play"]
+    vs_stage2 = log_loss - log_loss[model == "2. play-by-play"],
+    # Share of the intercept-only loss removed: the improvement over always
+    # predicting the base rate, on a 0-1 scale.
+    share_removed = -vs_intercept / log_loss[model == "1. intercept"]
   )
 
 money |>
@@ -1744,6 +1954,7 @@ money |>
     )
   ) |>
   fmt_number(columns = c(log_loss, vs_intercept, vs_stage2), decimals = 4) |>
+  fmt_percent(columns = share_removed, decimals = 1) |>
   fmt_number(columns = n, decimals = 0) |>
   gt_theme_538(quiet = TRUE)
 ```
