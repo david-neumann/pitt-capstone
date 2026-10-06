@@ -67,6 +67,11 @@ scrimmage ($\text{depth}_{\text{arr}} > 0$, §7). §1–8 report the floor, the
 play-by-play baseline, and the external benchmark; §9 adds stage 3, separation
 at the throw; §10 adds stage 4, the rest of the coverage geometry.
 
+**Every model is fit once, by `scripts/09_fit_models.R`.** This notebook reads
+its out-of-fold predictions and fits on all rows through `read_oof_preds()` and
+`read_full_fits()` (`R/evaluate.R`), which stop if `MODEL_SPECS` or the model
+frame has changed since those fits were made.
+
 :::
 
 ```{r}
@@ -74,6 +79,10 @@ at the throw; §10 adds stage 4, the rest of the coverage geometry.
 
 model_frame <- read_parquet(here("data", "processed", "model_frame.parquet"))
 model_funnel <- read_parquet(here("data", "processed", "model_funnel.parquet"))
+
+# Persisted by scripts/09_fit_models.R; both fail if stale.
+oof <- read_oof_preds(model_frame)
+fits <- read_full_fits(model_frame)
 
 fn <- function(flag, col = "dropped") {
   model_funnel[[col]][model_funnel$flag %in% flag]
@@ -250,7 +259,7 @@ week.
 Two different jobs, kept separate. The 17 cross-validation fits answer *how well
 does this predict* and are discarded — their only product is the prediction
 table in §4. A single fit on all the data answers *what did it learn*, and that
-is the object below.
+is the object below. `09` makes both.
 
 ::: {.callout-warning appearance="simple"}
 
@@ -262,7 +271,7 @@ performance estimate. Section 5 onward is where performance is measured.
 ```{r}
 #| label: full-fit
 
-f2 <- fit_full(mf_complete, MODEL_SPECS[["2. play-by-play"]])
+f2 <- fits[["2. play-by-play"]]
 
 summary(f2)
 ```
@@ -488,8 +497,8 @@ anything.
 ```{r}
 #| label: cv-predict
 
-# Stages 1 and 2 here; stage 3 is cross-validated in §9.
-preds <- cv_predict_all(mf_complete, folds, specs = MODEL_SPECS[1:2], verbose = FALSE)
+# Stages 1 and 2 here; stages 3 and 4 enter in §9 and §10.
+preds <- filter(oof, model %in% names(MODEL_SPECS)[1:2])
 pred_mean <- tapply(preds$.pred, preds$model, mean)
 s1_range <- range(preds$.pred[preds$model == "1. intercept"])
 s2_range <- range(preds$.pred[preds$model == "2. play-by-play"])
@@ -818,19 +827,8 @@ predictions. It is not refit or recalibrated (§8).
 ```{r}
 #| label: add-cp
 
-preds_all <- bind_rows(
-  preds,
-  mf_complete |>
-    transmute(
-      game_id,
-      play_id,
-      week,
-      complete,
-      .pred = cp,
-      n_train = NA_integer_,
-      model = "cp"
-    )
-)
+# read_oof_preds() appends cp from the model frame.
+preds_all <- filter(oof, model %in% c(names(MODEL_SPECS)[1:2], "cp"))
 
 calib_models <- c("2. play-by-play", "cp")
 ```
@@ -1193,7 +1191,7 @@ mf_complete |>
 ```{r}
 #| label: stage3-fit
 
-f3 <- fit_full(mf_complete, MODEL_SPECS[["3. + separation"]])
+f3 <- fits[["3. + separation"]]
 st3 <- summary(f3)$s.table
 sep_rows <- c("s(sep_throw)", "s(closing_throw)", "ti(sep_throw,depth_arr)")
 
@@ -1227,13 +1225,7 @@ Deviance explained in-sample rises from
 ```{r}
 #| label: stage3-cv
 
-preds3 <- cv_predict(
-  mf_complete,
-  folds,
-  MODEL_SPECS[["3. + separation"]],
-  "3. + separation",
-  verbose = FALSE
-)
+preds3 <- filter(oof, model == "3. + separation")
 preds_s3 <- bind_rows(preds_all, preds3)
 
 ll3 <- preds_s3 |>
@@ -1510,7 +1502,7 @@ least one help defender can reach the lane ahead of the ball.
 ```{r}
 #| label: stage4-fit
 
-f4 <- fit_full(mf_complete, MODEL_SPECS[["4. + geometry"]])
+f4 <- fits[["4. + geometry"]]
 st4 <- summary(f4)$s.table
 geo_rows <- c("s(lev_angle)", "s(tta_nearest)", "s(window_margin)")
 
@@ -1544,13 +1536,7 @@ Deviance explained in-sample:
 ```{r}
 #| label: stage4-cv
 
-preds4 <- cv_predict(
-  mf_complete,
-  folds,
-  MODEL_SPECS[["4. + geometry"]],
-  "4. + geometry",
-  verbose = FALSE
-)
+preds4 <- filter(oof, model == "4. + geometry")
 preds_s4 <- bind_rows(preds_s3, preds4)
 
 d4 <- bind_rows(
@@ -1734,6 +1720,7 @@ over the base rate. Separation accounts for
 to arrival, and the passing window for the rest. `cp`, partly in-sample for
 2018 and with a more flexible model class, sits between stages 2 and 3.
 
-The model frame these numbers are computed on is a build artifact
-(`scripts/08_build_model_frame.R`), so they are reproducible from `data/`
-without this notebook's assembly code.
+The model frame these numbers are computed on and the predictions they are
+computed from are build artifacts (`scripts/08_build_model_frame.R`,
+`scripts/09_fit_models.R`), so they are reproducible from `data/` without this
+notebook.

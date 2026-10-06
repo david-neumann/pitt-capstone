@@ -67,7 +67,9 @@ intervals, as in notebook 03. R6 selects on the outcome — those plays are most
 completions where the receiver carries the ball — so it is reported with that
 caveat rather than as a clean check.
 
-It reads `model_frame.parquet` and writes nothing to `data/`.
+It reads `model_frame.parquet` and, for the baseline, the out-of-fold
+predictions persisted by `scripts/09_fit_models.R`; it writes nothing to
+`data/`.
 
 ```{r}
 #| label: load_data
@@ -139,18 +141,25 @@ run <- function(df, specs, label) {
 }
 ```
 
-The baseline run must reproduce notebook 03's stage comparisons exactly, which
-checks the harness before anything is varied.
+The baseline is not refit: it is scored from the out-of-fold predictions that
+`scripts/09_fit_models.R` persisted, the same ones notebook 03 reports, so the
+two notebooks agree by construction. `run()` calls the same harness functions
+as `09` (`make_folds()`, `cv_predict_all()`), so each check below differs from
+the baseline only in what it changes.
 
 ```{r}
 #| label: baseline
 
-base <- run(mf, stage_specs, "baseline")
+# read_oof_preds() fails if MODEL_SPECS or the model frame has changed
+# since 09 ran.
+base_preds <- read_oof_preds(mf) |>
+  filter(model %in% names(stage_specs))
+base <- list(preds = base_preds, result = score(base_preds, mf, "baseline"))
 
 base$result |>
   select(comparison, estimate, conf_low, conf_high) |>
   gt() |>
-  tab_header(title = "Baseline, reproducing notebook 03") |>
+  tab_header(title = "Baseline, as in notebook 03") |>
   fmt_number(columns = c(estimate, conf_low, conf_high), decimals = 4) |>
   gt_theme_538(quiet = TRUE)
 ```

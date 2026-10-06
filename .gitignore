@@ -25,3 +25,7 @@ _freeze/
 
 **/*.quarto_ipynb
 CLAUDE.md
+
+# Persisted fits (scripts/09_fit_models.R)
+models/*
+!models/.gitkeep

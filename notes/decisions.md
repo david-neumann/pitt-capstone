@@ -34,6 +34,7 @@ written as a side effect of rendering `analysis/01_eda.qmd`.
 | `06_build_throw_frame.R` | built | Applies `R/arrival.R` at season scale; emits `arrival.parquet`, `approach.parquet`, and the throw-frame slice `throw_frame.parquet` (§6.9). Measured facts only; no outcome columns. |
 | `07_build_features.R` | built | Throw-frame coverage features; emits `features.parquet`: separation and closing speed (stage 3, §9.8); leverage, time to arrival, and the passing window (stage 4, §9.9). |
 | `08_build_model_frame.R` | built | Applies `QUESTION_RULE` on top of the analytic sample, prepares predictors, asserts completeness and the absence of leak columns; emits `model_frame.parquet` and `model_funnel.parquet` (§9.1). |
+| `09_fit_models.R` | built | Fits every stage in `MODEL_SPECS` once; emits `oof_preds.parquet`, `oof_specs.parquet`, and `models/full_fits.rds` (§9.4). |
 
 | Helper / notebook | Owns |
 |---|---|
@@ -43,9 +44,9 @@ written as a side effect of rendering `analysis/01_eda.qmd`.
 | `R/evaluate.R` | Model frame preparation, model specs, cross-validation harness, scoring (§9). |
 | `analysis/01_eda.qmd` | Data audit and sample-definition report. Writes nothing. |
 | `analysis/02_arrival_anchor.qmd` | Arrival-anchor investigation. Writes nothing. |
-| `analysis/03_model_baseline.qmd` | Models, scoring, calibration, and the `cp` benchmark, on `model_frame.parquet`. Writes nothing to `data/`. |
+| `analysis/03_model_baseline.qmd` | Models, scoring, calibration, and the `cp` benchmark, on `model_frame.parquet` and the fits from `09`. Writes nothing to `data/`. |
 | `analysis/04_arrival_season.qmd` | Season-scale validation of the arrival anchor (§6.9). Writes nothing. |
-| `analysis/05_robustness.qmd` | Robustness of the stage comparisons (§9.11). Writes nothing to `data/`. |
+| `analysis/05_robustness.qmd` | Robustness of the stage comparisons (§9.11); the baseline is read from `09`. Writes nothing to `data/`. |
 
 `R/arrival.R` exists as a helper rather than living inside `06` because the
 notebook is a second caller, and duplicated measurement logic goes stale. The
@@ -1021,7 +1022,8 @@ are rejected in the model frame.
 ## 9. Models and evaluation
 
 Implemented in `R/evaluate.R`, reported in `analysis/03_model_baseline.qmd`.
-The model frame is built by `scripts/08_build_model_frame.R`. Numbers are on
+The model frame is built by `scripts/08_build_model_frame.R` and the models are
+fit by `scripts/09_fit_models.R`. Numbers are on
 that final population unless marked otherwise; results on earlier populations
 are summarized in §9.10.
 
@@ -1171,6 +1173,24 @@ Deviance explained **8.74%** in-sample.
 - **REML** smoothness selection rather than mgcv's GCV default.
 - Predictions on the response scale, asserted complete and strictly inside
   (0, 1).
+- **Fit once, by a script.** `09_fit_models.R` writes the pooled out-of-fold
+  predictions (`data/processed/oof_preds.parquet`, one row per play and stage:
+  4 × 13,125 = 52,500 rows), a manifest (`oof_specs.parquet`: each spec as
+  text, a hash of the model inputs, R and mgcv versions), and the fits on all
+  rows (`models/full_fits.rds`, 7.8 MB). Every metric in §9.5–9.11 is a
+  function of the outcome, the out-of-fold predictions, and model-frame
+  columns, so the 68 fold fits are not kept. The notebooks read through
+  `read_oof_preds()` and `read_full_fits()`, which stop if any spec's
+  engine, formula, or knots differs from the manifest, a stage was added or
+  removed, or the hash of the model-frame columns the specs use has changed;
+  a change to any other column does not trigger a refit. `cp` is appended
+  from the model frame on read rather than stored twice. 09 reproduces the
+  notebook's out-of-fold log losses exactly (0.6548, 0.5994, 0.5550, 0.5431)
+  and takes about 3 minutes.
+- **Rejected:** Quarto `freeze`/`cache` (freeze is skipped when one file is
+  rendered, and neither tracks `R/` or `data/`), keeping the fold fits (no
+  metric needs them), and a wide table (the scoring functions take one row
+  per play and model, and a new stage would change the schema).
 
 ### 9.5 Scoring
 
@@ -1429,7 +1449,9 @@ For the record; superseded by the sections above.
 
 `analysis/05_robustness.qmd` refits the stages under alternative measurement
 and sample choices, with leave-one-week-out cross-validation and game-cluster
-intervals as in §9.5. A baseline run reproduces §9.8–9.9 exactly first.
+intervals as in §9.5. The baseline is scored from the predictions `09`
+persisted (§9.4), the same ones notebook 03 reports; each check refits with the
+same harness functions.
 
 | Check | n | Stage 2 log loss | Stage 4 − stage 2 | Stage 3 − stage 2 | Stage 4 − stage 3 |
 |---|---|---|---|---|---|
@@ -1501,6 +1523,15 @@ same function as the main timing features, and `08` carries them, with charted
   seconds remaining in the quarter, or re-parse in `02`, before using it.
 - `paired_delta()` sets its seed through `withr::with_seed()`, leaving the
   global RNG untouched.
+- **Arrow returns ALTREP vectors**, factor levels included, and their
+  serialized form depends on whether they have been materialized. A hash of
+  columns read from Parquet can therefore differ between sessions with the
+  data unchanged. `model_input_hash()` rebuilds each column as an ordinary
+  vector before hashing.
+- `gam.check()` / `k.check()` output varies between renders: with more than
+  5,000 rows the k-index is computed on a random subsample and its p-value by
+  permutation, neither seeded. Notebook 03 quotes only `edf` and `k'` from it,
+  which are deterministic.
 - **gganimate under knitr reads the chunk's figure options as device
   defaults**: `units = "in"`, so a `width` meant as pixels becomes inches and
   the render appears to hang; and `res` equal to the chunk dpi, doubled for

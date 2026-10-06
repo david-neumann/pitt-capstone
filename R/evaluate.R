@@ -17,6 +17,8 @@
 #   cv_predict()            out-of-fold predictions, one spec
 #   cv_predict_all()        out-of-fold predictions, every spec
 #   fit_full()              one fit on all rows, for interpretation
+#   read_oof_preds()        persisted out-of-fold predictions
+#   read_full_fits()        persisted fits on all rows
 #   pointwise_log_loss()    per-play log loss
 #   log_loss()              mean log loss
 #   paired_delta()          paired difference with a cluster bootstrap
@@ -196,7 +198,9 @@ MODEL_SPECS <- list(
 # Each stage must contain every term of the one before, so comparisons
 # are nested.
 local({
-  labels <- lapply(MODEL_SPECS, \(s) attr(stats::terms(s$formula), "term.labels"))
+  labels <- lapply(MODEL_SPECS, \(s) {
+    attr(stats::terms(s$formula), "term.labels")
+  })
   for (i in seq_along(labels)[-1]) {
     stopifnot(all(labels[[i - 1]] %in% labels[[i]]))
   }
@@ -459,6 +463,188 @@ fit_full <- function(df, spec) {
 }
 
 
+# ---- persisted fits ----------------------------------------------
+
+#' Each spec as text, one row per spec
+#'
+#' The stored copy, written by scripts/09_fit_models.R, is compared with
+#' the current one to detect a spec edited since the fits were made.
+#'
+#' @param specs A list like MODEL_SPECS.
+#' @return Tibble: `model`, `engine`, `formula`, `knots` (empty when the
+#'   spec has none).
+spec_table <- function(specs = MODEL_SPECS) {
+  flat <- function(x) paste(deparse(x, width.cutoff = 500L), collapse = " ")
+
+  tibble::tibble(
+    model = names(specs),
+    engine = vapply(specs, \(s) s$engine, character(1), USE.NAMES = FALSE),
+    formula = vapply(
+      specs,
+      \(s) flat(s$formula),
+      character(1),
+      USE.NAMES = FALSE
+    ),
+    knots = vapply(
+      specs,
+      \(s) if (is.null(s$knots)) "" else flat(s$knots),
+      character(1),
+      USE.NAMES = FALSE
+    )
+  )
+}
+
+
+#' Hash of the model inputs
+#'
+#' Covers every column the specs use, with rows in key order, so a model
+#' frame with different plays, outcomes, or feature values hashes
+#' differently. rlang::hash() is reproducible within an R version; an R
+#' upgrade can change it, which forces a refit but nothing worse.
+#'
+#' Columns read by arrow are ALTREP vectors, factor levels included, and
+#' their serialized form depends on whether they have been materialized.
+#' Each column is therefore rebuilt as an ordinary vector before hashing,
+#' so the hash depends on values only.
+#'
+#' @param df The scoring population.
+#' @param specs A list like MODEL_SPECS.
+#' @return A single string.
+model_input_hash <- function(df, specs = MODEL_SPECS) {
+  o <- order(df$game_id, df$play_id)
+
+  cols <- lapply(df[model_vars(specs)], \(v) {
+    if (is.factor(v)) {
+      list(levels = c(levels(v)), codes = as.integer(v)[o])
+    } else {
+      c(v)[o]
+    }
+  })
+
+  rlang::hash(cols)
+}
+
+
+#' Fail unless persisted fits match the current specs and model frame
+#'
+#' @param manifest Contents of oof_specs.parquet.
+#' @param df The scoring population, as read from model_frame.parquet.
+#' @param specs A list like MODEL_SPECS.
+#' @return `manifest`, invisibly.
+assert_fits_current <- function(manifest, df, specs = MODEL_SPECS) {
+  rerun <- " Rerun scripts/09_fit_models.R."
+
+  cmp <- dplyr::full_join(
+    spec_table(specs),
+    manifest[c("model", "engine", "formula", "knots")],
+    by = "model",
+    suffix = c("", ".stored")
+  )
+  # A model present on only one side has NA text, and is.na() catches it
+  # before the NA comparisons can.
+  differs <- is.na(cmp$engine) |
+    is.na(cmp$engine.stored) |
+    cmp$engine != cmp$engine.stored |
+    cmp$formula != cmp$formula.stored |
+    cmp$knots != cmp$knots.stored
+
+  if (any(differs)) {
+    stop(
+      "MODEL_SPECS differs from the specs the persisted fits were made ",
+      "with, for: ",
+      paste0(cmp$model[differs], collapse = ", "),
+      ".",
+      rerun,
+      call. = FALSE
+    )
+  }
+
+  if (!identical(unique(manifest$input_hash), model_input_hash(df, specs))) {
+    stop(
+      "The model frame differs from the one the persisted fits were made ",
+      "with.",
+      rerun,
+      call. = FALSE
+    )
+  }
+
+  invisible(manifest)
+}
+
+
+#' Out-of-fold predictions written by scripts/09_fit_models.R
+#'
+#' Fails if MODEL_SPECS or the model frame has changed since they were
+#' written. nflverse `cp` is appended from `df` as model "cp", so the
+#' benchmark is scored on the same rows without a second stored copy.
+#'
+#' @param df The scoring population, as read from model_frame.parquet.
+#' @param specs A list like MODEL_SPECS.
+#' @param dir Directory holding oof_preds.parquet and oof_specs.parquet.
+#' @return One row per (play, model), stages in spec order and then
+#'   `cp`: keys, `complete`, `.pred`, `n_train`, `model`.
+read_oof_preds <- function(
+  df,
+  specs = MODEL_SPECS,
+  dir = here::here("data", "processed")
+) {
+  assert_fits_current(
+    arrow::read_parquet(file.path(dir, "oof_specs.parquet")),
+    df,
+    specs
+  )
+
+  preds <- arrow::read_parquet(file.path(dir, "oof_preds.parquet"))
+
+  stopifnot(
+    nrow(preds) == nrow(df) * length(specs),
+    !any(duplicated(preds[c("game_id", "play_id", "model")]))
+  )
+
+  cp <- dplyr::transmute(
+    df,
+    game_id,
+    play_id,
+    week,
+    complete,
+    .pred = cp,
+    n_train = NA_integer_,
+    model = "cp"
+  )
+
+  dplyr::bind_rows(preds, cp)
+}
+
+
+#' Fits on all rows written by scripts/09_fit_models.R
+#'
+#' Fails under the same conditions as read_oof_preds(). mgcv must be
+#' attached to use the fits' methods.
+#'
+#' @inheritParams read_oof_preds
+#' @param dir Directory holding oof_specs.parquet.
+#' @param fits_dir Directory holding full_fits.rds.
+#' @return Named list of fits, one per spec, in spec order.
+read_full_fits <- function(
+  df,
+  specs = MODEL_SPECS,
+  dir = here::here("data", "processed"),
+  fits_dir = here::here("models")
+) {
+  assert_fits_current(
+    arrow::read_parquet(file.path(dir, "oof_specs.parquet")),
+    df,
+    specs
+  )
+
+  fits <- readRDS(file.path(fits_dir, "full_fits.rds"))
+
+  stopifnot(identical(names(fits), names(specs)))
+
+  fits
+}
+
+
 # ---- scoring -----------------------------------------------------
 
 #' Per-play log loss, in nats
@@ -615,7 +801,6 @@ paired_delta <- function(
 #'   below one when predictions are too extreme, above one when too
 #'   timid.
 #'
-#' See Van Calster et al. (2019).
 #'
 #' @inheritParams pointwise_log_loss
 #' @return Named numeric vector: `citl`, `intercept`, `slope`.
@@ -680,7 +865,10 @@ calibration_summary <- function(
     vapply(
       seq_len(B),
       \(b) {
-        i <- unlist(rows[sample.int(n_g, n_g, replace = TRUE)], use.names = FALSE)
+        i <- unlist(
+          rows[sample.int(n_g, n_g, replace = TRUE)],
+          use.names = FALSE
+        )
         calibration_stats(y[i], p[i])
       },
       numeric(3)
