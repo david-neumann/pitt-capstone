@@ -1,0 +1,425 @@
+---
+title: "Lateral location"
+subtitle: "STAT 1961 Capstone — tracking-derived throw location as a replacement for charted pass_location"
+author: "David Neumann"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: [brite, ../theme/capstone.scss]
+    code-summary: "Show code"
+    fig-width: 8
+    fig-height: 5
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# 0. Setup
+
+```{r}
+#| label: setup
+#| include: false
+if (Sys.getenv("RENV_PROJECT") == "") {
+  root <- normalizePath("..", mustWork = TRUE)
+  Sys.setenv(RENV_PROJECT = root)
+  setwd(root)
+  source("renv/activate.R")
+}
+
+library(tidyverse)
+library(arrow)
+library(here)
+library(gt)
+library(gtExtras)
+library(scales)
+
+# mgcv must be attached: the spec formulas use bare s() and ti().
+library(mgcv)
+
+source(here("R", "constants.R"))
+source(here("R", "utils.R"))
+source(here("R", "evaluate.R"))
+```
+
+## 0.1 What this notebook is
+
+Stage 2 codes the throw's direction with charted `pass_location` (left,
+middle, right). `notes/decisions.md` §9.13 derives two tracking measures from
+the arrival point: `lat_arr`, the lateral offset from the release point, of
+which the charted variable is a three-level version, and `sideline_arr`, the
+distance to the nearer sideline, which the charted variable does not measure.
+This notebook compares candidate stage 2 specs that replace `pass_location`
+with them, and refits stage 4 on the candidates to see what happens to the
+tracking gain. No spec changes here.
+
+Expectations, recorded before fitting (§9.13):
+
+- **A** (`s(lat_arr)` for `pass_location`): about 0 to 0.001 nats, since it is
+  the same information made continuous.
+- **B** (A + `s(sideline_arr)`): 0.002–0.006 nats, from the boundary.
+- **C** (B with `sideline_arr` clamped at 0): below B. Out-of-bounds arrivals
+  are largely missed throws, so the gap from B to C is how much of B's gain is
+  throw accuracy, which is decided after the release, rather than location.
+- **Stage 4 on B or C**: the gain over its own stage 2 shrinks slightly, mostly
+  at the expense of `s(window_margin)`, which overlaps with depth (§9.12).
+
+It reads `model_frame.parquet` and the predictions persisted by
+`scripts/09_fit_models.R`, and writes nothing to `data/`.
+
+```{r}
+#| label: load_data
+
+mf <- read_parquet(here("data", "processed", "model_frame.parquet")) |>
+  mutate(
+    sideline_in = pmax(sideline_arr, 0),
+    sideline_rec_in = pmax(sideline_rec, 0)
+  )
+stopifnot(identical(mf, assert_complete(mf)))
+
+oof <- read_oof_preds(mf)
+```
+
+# 1. Candidates
+
+```{r}
+#| label: candidates
+
+# Replace terms by label, keeping the formula's environment so that bare s()
+# resolves. Fails on a label to drop that is not in the formula.
+swap_terms <- function(spec, drop = character(0), add = character(0)) {
+  labels <- attr(stats::terms(spec$formula), "term.labels")
+  stopifnot(all(drop %in% labels), !any(add %in% labels))
+  spec$formula <- stats::reformulate(
+    c(setdiff(labels, drop), add),
+    response = "complete",
+    env = environment(spec$formula)
+  )
+  spec
+}
+
+s2 <- MODEL_SPECS[["2. play-by-play"]]
+s4 <- MODEL_SPECS[["4. + geometry"]]
+
+lat <- "s(lat_arr)"
+side <- c(lat, "s(sideline_arr)")
+side_in <- c(lat, "s(sideline_in)")
+window <- "s(window_margin)"
+
+candidates <- list(
+  `2A` = swap_terms(s2, "pass_location", lat),
+  `2B` = swap_terms(s2, "pass_location", side),
+  `2C` = swap_terms(s2, "pass_location", side_in),
+  `4B` = swap_terms(s4, "pass_location", side),
+  `4C` = swap_terms(s4, "pass_location", side_in),
+  `4B without window` = swap_terms(s4, c("pass_location", window), side),
+  `4 without window` = swap_terms(s4, window)
+)
+
+tibble(
+  model = names(candidates),
+  formula = map_chr(candidates, \(s) {
+    paste(deparse(s$formula, width.cutoff = 500L), collapse = " ")
+  })
+) |>
+  gt() |>
+  gt_theme_538(quiet = TRUE)
+```
+
+# 2. Out-of-fold comparison
+
+```{r}
+#| label: refit
+
+# Folds from mf itself, which carries sideline_in.
+folds <- make_folds(mf)
+
+preds <- bind_rows(
+  filter(oof, model %in% c("2. play-by-play", "4. + geometry")),
+  imap(
+    candidates,
+    \(spec, name) cv_predict(mf, folds, spec, name, verbose = FALSE)
+  ) |>
+    list_rbind()
+)
+```
+
+```{r}
+#| label: log-loss
+
+preds |>
+  group_by(model) |>
+  summarize(n = n(), log_loss = log_loss(complete, .pred), .groups = "drop") |>
+  arrange(desc(log_loss)) |>
+  gt() |>
+  tab_header(title = "Out-of-fold log loss") |>
+  fmt_number(columns = log_loss, decimals = 4) |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Paired differences, model minus reference (negative favours the model):
+
+```{r}
+#| label: deltas
+
+comparisons <- tribble(
+  ~question, ~reference, ~model,
+  "A: lateral offset for pass_location", "2. play-by-play", "2A",
+  "B: + sideline distance", "2. play-by-play", "2B",
+  "C: + sideline distance, clamped at 0", "2. play-by-play", "2C",
+  "B vs C: out-of-bounds distance", "2C", "2B",
+  "sideline beyond lateral offset", "2A", "2B",
+  "stage 4 with B vs stage 4", "4. + geometry", "4B",
+  "tracking gain, current", "2. play-by-play", "4. + geometry",
+  "tracking gain on B", "2B", "4B",
+  "tracking gain on C", "2C", "4C",
+  "window margin, current stage 4", "4. + geometry", "4 without window",
+  "window margin, stage 4 on B", "4B", "4B without window"
+)
+
+deltas <- comparisons |>
+  pmap(\(question, reference, model) {
+    paired_delta(preds, reference, model, "game_id") |>
+      mutate(question = question)
+  }) |>
+  list_rbind()
+
+deltas |>
+  select(question, reference, model, estimate, conf_low, conf_high) |>
+  gt() |>
+  tab_header(
+    title = "Paired differences in out-of-fold log loss",
+    subtitle = "Model minus reference. Game-cluster bootstrap, 95% interval"
+  ) |>
+  fmt_number(columns = c(estimate, conf_low, conf_high), decimals = 4) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+# 3. Calibration
+
+Point estimates only (`calibration_stats()`), overall and by depth; the
+bootstrap intervals are in notebook 03 for the adopted stages.
+
+```{r}
+#| label: calibration
+
+stage2_models <- c("2. play-by-play", "2A", "2B", "2C")
+
+by_depth <- preds |>
+  filter(model %in% stage2_models) |>
+  left_join(
+    select(mf, game_id, play_id, depth_arr),
+    by = c("game_id", "play_id")
+  ) |>
+  mutate(depth = as.character(depth_bucket(depth_arr)))
+
+bind_rows(mutate(by_depth, depth = "all"), by_depth) |>
+  group_by(model, depth) |>
+  summarize(
+    n = n(),
+    stats = list(calibration_stats(complete, .pred)),
+    .groups = "drop"
+  ) |>
+  unnest_wider(stats) |>
+  select(depth, model, n, intercept, slope) |>
+  arrange(depth, model) |>
+  gt(groupname_col = "depth") |>
+  fmt_number(columns = c(intercept, slope), decimals = 3) |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+# 4. Candidate B, interpreted
+
+A single fit on all rows; in-sample, for the shapes.
+
+```{r}
+#| label: fit-2b
+
+f2b <- fit_full(mf, candidates[["2B"]])
+st <- summary(f2b)$s.table
+
+st[c("s(lat_arr)", "s(sideline_arr)"), , drop = FALSE] |>
+  as.data.frame() |>
+  rownames_to_column("smooth") |>
+  rename(p = `p-value`) |>
+  gt() |>
+  fmt_number(columns = c(edf, Ref.df, Chi.sq), decimals = 2) |>
+  fmt_scientific(columns = p, decimals = 2) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: smooths-2b
+#| fig-height: 4
+
+par(mfrow = c(1, 2))
+for (sm in c("s(lat_arr)", "s(sideline_arr)")) {
+  plot(
+    f2b,
+    select = match(sm, rownames(st)),
+    shade = TRUE,
+    seWithMean = TRUE,
+    scale = 0,
+    rug = TRUE
+  )
+  abline(h = 0, lty = 2, col = "grey50")
+}
+par(mfrow = c(1, 1))
+```
+
+Concurvity of the new smooths with the other stage 2 terms (`worst`):
+
+```{r}
+#| label: concurvity-2b
+
+cc <- concurvity(f2b, full = FALSE)$worst
+keep <- c("s(depth_arr)", "s(lat_arr)", "s(sideline_arr)")
+cc_keep <- cc[keep, keep]
+diag(cc_keep) <- NA
+
+cc_keep |>
+  as.data.frame() |>
+  rownames_to_column("smooth") |>
+  gt() |>
+  fmt_number(columns = -smooth, decimals = 2) |>
+  sub_missing(missing_text = "") |>
+  gt_theme_538(quiet = TRUE)
+```
+
+# 5. Second round: binary middle and the receiver's sideline distance
+
+Round one (§2–4, `notes/decisions.md` §9.13) found that the lateral offset adds
+nothing and that the location effect is the sideline. Two revisions follow from
+it:
+
+- **`pass_location` becomes binary**, middle or not (`pass_middle`), the coding
+  nflverse `cp` uses. There is no football argument for left and right to
+  differ, the two levels are not distinguishable (§9.3), and the signed lateral
+  offset fit as a flat line in candidate B.
+- **Sideline distance is measured at the targeted receiver** at the arrival
+  frame (`sideline_rec`) rather than at the ball. A ball sailing out of bounds
+  is largely a missed throw, decided after the release; the receiver's
+  position records where the catch would be made. The two measures correlate
+  at 0.99 and differ almost only at the boundary. The receiver's tracked
+  position is out of bounds on 109 plays (against 203 balls), partly because
+  the sensor is on the shoulder pads, so the measure is also fit clamped at 0.
+
+Expectations, recorded before fitting:
+
+- **E** (`pass_middle` for `pass_location`): $|\bar d| < 0.0005$.
+- **F** (E + `s(sideline_rec)`): close to B, a gain of 0.004 to 0.006.
+- **G** (F clamped at 0): slightly below F, by less than B–C's 0.0009, since
+  fewer receivers than balls are out of bounds.
+- **Stage 4 on F**: a tracking gain near the 0.0552 found on B.
+
+```{r}
+#| label: candidates-2
+
+side_rec <- c("pass_middle", "s(sideline_rec)")
+side_rec_in <- c("pass_middle", "s(sideline_rec_in)")
+
+candidates_2 <- list(
+  `2E` = swap_terms(s2, "pass_location", "pass_middle"),
+  `2F` = swap_terms(s2, "pass_location", side_rec),
+  `2G` = swap_terms(s2, "pass_location", side_rec_in),
+  `4F` = swap_terms(s4, "pass_location", side_rec)
+)
+
+preds_2 <- bind_rows(
+  preds,
+  imap(
+    candidates_2,
+    \(spec, name) cv_predict(mf, folds, spec, name, verbose = FALSE)
+  ) |>
+    list_rbind()
+)
+```
+
+```{r}
+#| label: deltas-2
+
+comparisons_2 <- tribble(
+  ~question, ~reference, ~model,
+  "E: pass_middle for pass_location", "2. play-by-play", "2E",
+  "F: + receiver sideline distance", "2. play-by-play", "2F",
+  "G: + receiver sideline distance, clamped at 0", "2. play-by-play", "2G",
+  "F vs G: receiver out of bounds", "2G", "2F",
+  "F vs C: receiver vs ball (clamped)", "2C", "2F",
+  "stage 4 with F vs stage 4", "4. + geometry", "4F",
+  "tracking gain on F", "2F", "4F"
+)
+
+comparisons_2 |>
+  pmap(\(question, reference, model) {
+    paired_delta(preds_2, reference, model, "game_id") |>
+      mutate(question = question)
+  }) |>
+  list_rbind() |>
+  select(question, reference, model, estimate, conf_low, conf_high) |>
+  gt() |>
+  tab_header(
+    title = "Paired differences in out-of-fold log loss, round two",
+    subtitle = "Model minus reference. Game-cluster bootstrap, 95% interval"
+  ) |>
+  fmt_number(columns = c(estimate, conf_low, conf_high), decimals = 4) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+```{r}
+#| label: calibration-2
+
+by_depth_2 <- preds_2 |>
+  filter(model %in% c("2. play-by-play", "2C", "2E", "2F", "2G")) |>
+  left_join(
+    select(mf, game_id, play_id, depth_arr),
+    by = c("game_id", "play_id")
+  ) |>
+  mutate(depth = as.character(depth_bucket(depth_arr)))
+
+bind_rows(mutate(by_depth_2, depth = "all"), by_depth_2) |>
+  group_by(model, depth) |>
+  summarize(
+    n = n(),
+    log_loss = log_loss(complete, .pred),
+    stats = list(calibration_stats(complete, .pred)),
+    .groups = "drop"
+  ) |>
+  unnest_wider(stats) |>
+  select(depth, model, n, log_loss, intercept, slope) |>
+  arrange(depth, model) |>
+  gt(groupname_col = "depth") |>
+  fmt_number(columns = c(log_loss, intercept, slope), decimals = 4) |>
+  fmt_number(columns = n, decimals = 0) |>
+  gt_theme_538(quiet = TRUE)
+```
+
+Candidate F on all rows, in-sample, for the shapes:
+
+```{r}
+#| label: fit-2f
+#| fig-height: 4
+
+f2f <- fit_full(mf, candidates_2[["2F"]])
+
+summary(f2f)$p.table["pass_middle", , drop = FALSE] |>
+  as.data.frame() |>
+  rownames_to_column("term") |>
+  gt() |>
+  fmt_number(columns = -term, decimals = 3) |>
+  gt_theme_538(quiet = TRUE)
+
+st_f <- summary(f2f)$s.table
+plot(
+  f2f,
+  select = match("s(sideline_rec)", rownames(st_f)),
+  shade = TRUE,
+  seWithMean = TRUE,
+  scale = 0,
+  rug = TRUE
+)
+abline(h = 0, lty = 2, col = "grey50")
+```

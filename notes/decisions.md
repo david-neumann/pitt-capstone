@@ -1587,6 +1587,82 @@ accuracy, which is decided after the release. `depth_arr` has the same property
 for overthrows, but the sideline makes it sharper. To be settled before
 adoption, by comparing `sideline_arr` with `pmax(sideline_arr, 0)`.
 
+**Candidate comparison** (`analysis/07_lateral_location.qmd`; same folds,
+game-cluster intervals; expectations recorded in the notebook before fitting).
+Each candidate replaces `pass_location` in stage 2, and in stage 4 where
+stated:
+
+| Candidate | Out-of-fold log loss | Against current stage 2 |
+|---|---|---|
+| current stage 2 (charted `pass_location`) | 0.5994 | — |
+| A: `s(lat_arr)` | 0.5995 | +0.0001 [−0.0008, 0.0011] |
+| B: A + `s(sideline_arr)` | 0.5937 | −0.0057 [−0.0077, −0.0037] |
+| C: A + `s(pmax(sideline_arr, 0))` | 0.5946 | −0.0048 [−0.0066, −0.0031] |
+
+- **The lateral offset adds nothing over the charted variable**, as expected:
+  they are the same information. In B it fits as a flat line (edf 1.01, $p =
+  0.56$).
+- **Sideline distance carries the location effect.** It adds 0.0058
+  [0.0040, 0.0077] beyond the lateral offset. The smooth is flat beyond about
+  4 yd from the sideline and falls steeply inside it, to about −1 on the logit
+  scale at the line and below it out of bounds (edf 7.56). The charted
+  "middle" effect (+0.257, §9.3) was largely this: middle throws are far from
+  the sideline. Concurvity of `s(lat_arr)` with `s(sideline_arr)` is 0.77.
+- **Out-of-bounds distance is worth 0.0009 [0.0002, 0.0014]** (B against C),
+  about a sixth of B's gain. That part is throw accuracy.
+- **In stage 4**, B improves on the current stage 4 by 0.0046 [0.0026,
+  0.0065], so the tracking features had not been recovering the sideline.
+- **The tracking gain barely moves**: stage 4 − stage 2 is −0.0552 [−0.0610,
+  −0.0493] on B and −0.0553 [−0.0611, −0.0495] on C, against −0.0563.
+- **The passing window did not lose its contribution**, contrary to the
+  expectation: dropping `s(window_margin)` costs 0.0034 [0.0020, 0.0048] on B
+  against 0.0030 [0.0017, 0.0043] on the current stage 4.
+- **Calibration** (stage 2, point estimates): unchanged overall (slope 0.987);
+  better by depth. Slopes move from 0.935 to 0.966 (B) and 0.973 (C) at 0–10
+  yd, 1.161 to 1.057 (both) at 10–20 yd, and 0.837 to 0.888 (B) and 0.860 (C)
+  at 20+ yd.
+
+**Round two.** Two revisions, argued before fitting:
+
+- **`lat_arr` is dropped.** It adds nothing over the charted variable and is
+  flat once sideline distance is present.
+- **`pass_location` becomes binary**, middle or not (`pass_middle`), as in
+  nflverse `cp`. There is no football argument for left and right to differ;
+  they are not distinguishable (§9.3), and the signed lateral offset fit as a
+  flat line.
+- **Sideline distance is measured at the targeted receiver** at the arrival
+  frame (`sideline_rec`), not at the ball, so that a ball sailing out of bounds,
+  a missed throw decided after the release, does not enter as location. The
+  arrival frame rather than the throw frame because the boundary acts where
+  the catch is made, and because `depth_arr` is measured there too. The
+  receiver's tracked position is out of bounds on 109 plays (16.5% complete)
+  against 203 balls; the sensor is on the shoulder pads, and some receivers
+  drift with an errant throw. Receiver and ball sideline distances correlate
+  at 0.99 and differ almost only at the boundary.
+
+| Candidate | Out-of-fold log loss | Against current stage 2 |
+|---|---|---|
+| E: `pass_middle` for `pass_location` | 0.5994 | 0.0000 [−0.0002, 0.0002] |
+| F: E + `s(sideline_rec)` | 0.5946 | −0.0048 [−0.0065, −0.0032] |
+| G: E + `s(pmax(sideline_rec, 0))` | 0.5949 | −0.0044 [−0.0060, −0.0029] |
+
+- **The binary coding loses nothing.** In F, middle is +0.177 (SE 0.070) on
+  the logit scale beyond sideline distance, so it carries something the
+  boundary does not.
+- **Receiver and clamped ball measures predict equally** (F against C: 0.0000
+  [−0.0009, 0.0009]). The receiver's out-of-bounds tail is worth 0.0004
+  [0.0001, 0.0006] (F against G), under half the ball's.
+- **The shape matches the ball version**: flat beyond about 4 yd, about −1.2
+  on the logit scale at the line (edf 7.21).
+- **Stage 4 on F** improves on the current stage 4 by 0.0043 [0.0027,
+  0.0059]; the tracking gain is −0.0558 [−0.0616, −0.0500].
+- **Calibration** (stage 2, point estimates): overall slope 0.987, unchanged.
+  By depth, F moves the slope from 0.935 to 0.963 at 0–10 yd, 1.161 to 1.055
+  at 10–20 yd, and 0.837 to 0.910 at 20+ yd, the best deep-throw slope of any
+  candidate.
+
+Not yet adopted.
+
 ## 10. Known technical constraints
 
 - Arrow `Dataset` objects do not survive knitr cache serialization. Caching must

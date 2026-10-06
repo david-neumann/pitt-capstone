@@ -16,8 +16,9 @@
 # Also carried, for analysis/05_robustness.qmd: charted `air_yards` and
 # `yards_to_go` (to rebuild distance to the sticks from charted depth), the
 # p90-motion-constant timing features, and the arrival and defect
-# diagnostics. `lat_arr` and `sideline_arr` are carried as candidate
-# replacements for `pass_location` (notes/decisions.md §9.13).
+# diagnostics. `lat_arr`, `sideline_arr`, `sideline_rec`, and
+# `pass_middle` are carried as candidate replacements for `pass_location`
+# (notes/decisions.md §9.13).
 #
 # Outputs, in data/processed/:
 #   model_frame.parquet   one row per play in the population
@@ -83,6 +84,12 @@ arrival <- P("arrival.parquet") |>
     at_window_edge
   )
 
+receiver_arr <- P("throw_frame.parquet") |>
+  filter(anchor == "arrival", is_target) |>
+  select(game_id, play_id, y_rec_arr = y)
+
+stopifnot(!any(duplicated(receiver_arr[c("game_id", "play_id")])))
+
 features <- P("features.parquet") |>
   select(
     game_id,
@@ -103,6 +110,7 @@ spine <- analytic_sample |>
   left_join(plays, by = keys) |>
   left_join(pbp, by = keys) |>
   left_join(arrival, by = keys) |>
+  left_join(receiver_arr, by = keys) |>
   left_join(features, by = keys)
 
 stopifnot(nrow(spine) == nrow(analytic_sample))
@@ -156,6 +164,8 @@ model_frame <- prepared[
     window_margin_p90,
     lat_arr,
     sideline_arr,
+    sideline_rec,
+    pass_middle,
     used_fallback,
     at_window_edge,
     has_kinematic_defect,
