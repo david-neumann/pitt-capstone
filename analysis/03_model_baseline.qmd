@@ -1716,9 +1716,13 @@ geometry at the throw lowers out-of-fold log loss by
 [`r sprintf("%.4f", -d42$conf_high)`, `r sprintf("%.4f", -d42$conf_low)`], more
 than the `r sprintf("%.4f", -dg$estimate)` that the play-by-play features gain
 over the base rate. Separation accounts for
-`r percent(d32$estimate / d42$estimate, accuracy = 1)` of that; leverage, time
-to arrival, and the passing window for the rest. `cp`, partly in-sample for
-2018 and with a more flexible model class, sits between stages 2 and 3.
+`r percent(d32$estimate / d42$estimate, accuracy = 1)` of that in the nested
+order, in which it enters first, and leverage, time to arrival, and the passing
+window for the rest. The split depends on the order: much of separation's gain
+is shared with the timing features, which are largely its distance expressed in
+time, and `analysis/06_term_contributions.qmd` divides the gain without an
+order (`notes/decisions.md` §9.12). `cp`, partly in-sample for 2018 and with a
+more flexible model class, sits between stages 2 and 3.
 
 The model frame these numbers are computed on and the predictions they are
 computed from are build artifacts (`scripts/08_build_model_frame.R`,

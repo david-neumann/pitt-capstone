@@ -1430,8 +1430,10 @@ with nothing downstream to protect.
 as stages 3 and 4, so stage 4 − stage 2 answers the question: coverage geometry
 at the throw lowers out-of-fold log loss by 0.0563 nats [0.0503, 0.0622], more
 than the 0.0554 that the play-by-play features gain over the base rate.
-Separation accounts for 79% of it; leverage, time to arrival, and the passing
-window for the rest. `cp` sits between stages 2 and 3.
+Separation accounts for 79% of it in the nested order, in which separation
+enters first, and leverage, time to arrival, and the passing window for the
+rest. Without an order, 36% is unique to separation, 21% unique to the geometry
+terms, and 43% shared (§9.12). `cp` sits between stages 2 and 3.
 
 ### 9.10 Results on earlier populations
 
@@ -1484,6 +1486,61 @@ baseline.
 Implementation: `07` writes `tta_nearest_p90` and `window_margin_p90` from the
 same function as the main timing features, and `08` carries them, with charted
 `air_yards` and `yards_to_go`, into `model_frame.parquet`.
+
+### 9.12 Term contributions
+
+`analysis/06_term_contributions.qmd` refits stage 4 without each tracking term,
+or block of terms, on the same leave-one-week-out folds, and reports the rise
+in out-of-fold log loss with a game-cluster interval: the term's contribution
+given all the others. Diagnostic only; no spec changed.
+
+| Dropped from stage 4 | Rise in log loss |
+|---|---|
+| separation, `s(sep_throw)` + `ti(sep_throw, depth_arr)` | 0.0165 [0.0132, 0.0199] |
+| time to arrival, `s(tta_nearest)` | 0.0079 [0.0057, 0.0100] |
+| closing speed, `s(closing_throw)` | 0.0077 [0.0055, 0.0098] |
+| passing window, `s(window_margin)` | 0.0030 [0.0017, 0.0043] |
+| separation × depth, `ti(sep_throw, depth_arr)` alone | 0.0011 [0.0001, 0.0021] |
+| leverage angle, `s(lev_angle)` | 0.0008 [0.0001, 0.0015] |
+| **separation block** (the stage 3 terms) | 0.0204 [0.0167, 0.0242] |
+| **geometry block** (the stage 4 terms; = stage 4 − stage 3, §9.9) | 0.0119 [0.0091, 0.0148] |
+
+Separation and its depth interaction are dropped together because `ti()` is
+built to sit alongside its main effects. The geometry-block row reproduces
+§9.9 exactly, which checks the refit harness.
+
+**Every term earns its place.** No interval includes zero, so none is a
+removal candidate. Leverage angle and the separation-by-depth interaction are
+the weakest, both with lower bounds at 0.0001; the interaction is kept for the
+deep-throw calibration it was added for (§9.8), and leverage has the lowest
+concurvity of any tracking term (worst 0.39), so it carries little but carries
+something the others do not.
+
+**The 79% attribution in §9.9 depends on order.** It credits separation with
+all of stage 3 − stage 2 because separation enters first. Decomposing stage 4 −
+stage 2 (0.0563) without an order:
+
+| Part | Nats | Share |
+|---|---|---|
+| unique to separation (separation block) | 0.0204 | 36% |
+| unique to the geometry terms (geometry block) | 0.0119 | 21% |
+| shared: either block recovers it without the other | 0.0240 | 43% |
+
+The shared part is 0.0444 − 0.0204, stage 3's gain over stage 2 less what
+separation adds once the geometry terms are present. Separation and the timing
+features are partly the same information: the nearest defender's time margin
+is largely its distance expressed in time.
+
+**The three geometry terms are nearly additive**: their drop-one rises sum to
+0.0117 against the block's 0.0119. The overlap is between blocks, not within
+the geometry block.
+
+**Concurvity** (stage 4 fit on all rows, `worst`): no tracking smooth exceeds
+0.67 against all other terms (`s(tta_nearest)`), so nothing is redundant.
+The largest pairwise values are `s(sep_throw)` with its interaction (0.43, by
+construction), `s(window_margin)` with `s(depth_arr)` (0.40: longer throws give
+help defenders more time), `s(sep_throw)` with `s(tta_nearest)` (0.38), and
+`s(closing_throw)` with `s(tta_nearest)` (0.35).
 
 ## 10. Known technical constraints
 
