@@ -1542,6 +1542,51 @@ construction), `s(window_margin)` with `s(depth_arr)` (0.40: longer throws give
 help defenders more time), `s(sep_throw)` with `s(tta_nearest)` (0.38), and
 `s(closing_throw)` with `s(tta_nearest)` (0.35).
 
+### 9.13 Lateral location: candidate features
+
+Candidates to replace charted `pass_location` in stage 2, as `depth_arr`
+replaced charted `air_yards` (§9.3). Derived by `prepare_model_frame()` from
+`arrival.parquet`, carried by `08`, and not yet in `MODEL_SPECS`:
+
+- `lat_arr` $= y_{\text{arr}} - y_{\text{throw}}$: the arrival point's lateral
+  offset from the release point. Positive is toward the passer's left
+  (standardized coordinates face $+x$, and $y$ increases to the left).
+- `sideline_arr` $= \min(y_{\text{arr}},\ 53.\overline{3} - y_{\text{arr}})$:
+  distance from the arrival point to the nearer sideline, negative when the
+  ball arrives out of bounds.
+
+Like `depth_arr`, both use where the ball arrived as the measure of where it
+was thrown, so they inherit that assumption (§6.9). Rebuilding `08` left every
+existing column and the funnel identical, and the persisted fits stayed valid
+(§9.4). No missing values.
+
+**Sign validated against charted `pass_location`:**
+
+| Charted | Plays | Median `lat_arr` | Share with `lat_arr` > 0 | 10th–90th percentile | Median `sideline_arr` | Complete |
+|---|---|---|---|---|---|---|
+| left | 4,592 | +15.3 | 99.2% | +6.8 to +23.5 | 9.3 | 62.3% |
+| middle | 3,593 | +0.0 | 50.2% | −6.1 to +6.6 | 22.8 | 69.0% |
+| right | 4,940 | −14.3 | 1.9% | −22.9 to −5.5 | 8.7 | 61.3% |
+
+The charted location is the throw's direction relative to the passer, with
+"middle" about ±6 yd of the release point, not a third of the field.
+`lat_arr` is therefore its continuous version; `sideline_arr` measures
+something the charted variable does not, the field boundary. The two are
+correlated ($r(|\texttt{lat\_arr}|, \texttt{sideline\_arr}) = -0.86$).
+
+**Descriptively**, completion is flat at 67–70% beyond 6 yd from the sideline
+and falls inside it: 58.8% at 3–6 yd, 45.2% at 0–3 yd, and 21.1% for the 204
+arrivals at or beyond the sideline (203 strictly out of bounds). By lateral
+offset it is flat to 20 yd (65–69%) and 49.3% beyond. Both are confounded with
+depth: throws within 3 yd of the sideline have median depth 15.3 yd against
+5.4–6.2 yd beyond 6 yd, so the model, not these tables, has to separate them.
+
+**Open: out-of-bounds arrivals.** A ball arriving beyond the sideline is
+largely a missed throw, so negative `sideline_arr` partly records throw
+accuracy, which is decided after the release. `depth_arr` has the same property
+for overthrows, but the sideline makes it sharper. To be settled before
+adoption, by comparing `sideline_arr` with `pmax(sideline_arr, 0)`.
+
 ## 10. Known technical constraints
 
 - Arrow `Dataset` objects do not survive knitr cache serialization. Caching must

@@ -16,7 +16,8 @@
 # Also carried, for analysis/05_robustness.qmd: charted `air_yards` and
 # `yards_to_go` (to rebuild distance to the sticks from charted depth), the
 # p90-motion-constant timing features, and the arrival and defect
-# diagnostics.
+# diagnostics. `lat_arr` and `sideline_arr` are carried as candidate
+# replacements for `pass_location` (notes/decisions.md §9.13).
 #
 # Outputs, in data/processed/:
 #   model_frame.parquet   one row per play in the population
@@ -72,7 +73,15 @@ pbp <- P("pbp.parquet") |>
   )
 
 arrival <- P("arrival.parquet") |>
-  select(game_id, play_id, depth_arr, used_fallback, at_window_edge)
+  select(
+    game_id,
+    play_id,
+    depth_arr,
+    y_throw,
+    y_arr,
+    used_fallback,
+    at_window_edge
+  )
 
 features <- P("features.parquet") |>
   select(
@@ -145,6 +154,8 @@ model_frame <- prepared[
     window_n_pos,
     tta_nearest_p90,
     window_margin_p90,
+    lat_arr,
+    sideline_arr,
     used_fallback,
     at_window_edge,
     has_kinematic_defect,

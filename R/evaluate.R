@@ -40,12 +40,18 @@
 #'   NA, so assert_complete() still sees it.
 #' - `number_of_pass_rushers` is clamped to `rush_range`; the tails hold
 #'   a handful of plays and would otherwise be extrapolated in some folds.
+#' - `lat_arr = y_arr - y_throw` is the arrival point's lateral offset
+#'   from the release point. Positive is toward the passer's left:
+#'   standardized coordinates face +x, and `y` increases to the left.
+#' - `sideline_arr` is the arrival point's distance to the nearer
+#'   sideline, negative when the ball arrives out of bounds.
 #' - `dist_to_sticks = depth_arr - yards_to_go` replaces `yards_to_go`,
 #'   since all three together are linearly dependent.
 #' - `home` is 1 when the offense is the home team.
 #'
 #' @param df Throws with `pass_result` in C, I, IN and the predictor
-#'   columns, including `depth_arr` from arrival.parquet.
+#'   columns, including `depth_arr`, `y_throw`, and `y_arr` from
+#'   arrival.parquet.
 #' @param min_level_n Minimum plays per factor level.
 #' @param rush_range Clamp range for `number_of_pass_rushers`.
 #' @return `df` with the response and derived columns added.
@@ -85,6 +91,8 @@ prepare_model_frame <- function(
         rush_range[2]
       ),
       dist_to_sticks = depth_arr - yards_to_go,
+      lat_arr = y_arr - y_throw,
+      sideline_arr = pmin(y_arr, FIELD_WIDTH - y_arr),
       home = as.integer(posteam_type == "home")
     )
 }
